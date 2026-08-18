@@ -1,0 +1,42 @@
+{
+  "name": "comprehensible-learning-portal",
+  "version": "0.1.0",
+  "description": "Unified bilingual EPUB and YouTube learning portal for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "verify": "npm run lint && npm run test:pure && npm run build && npm run test:clean-install && node scripts/acceptance-audit.mjs",
+    "test:pure": "node scripts/test-youtube-pure.mjs && node scripts/test-core-pure.mjs",
+    "test:clean-install": "node scripts/test-clean-install.mjs",
+    "smoke:codex": "node scripts/smoke-codex-live.mjs",
+    "smoke:agents": "node scripts/smoke-agent-clis-live.mjs",
+    "smoke:youtube": "node scripts/smoke-youtube-live.mjs",
+    "smoke:whisper": "node scripts/smoke-whisper-live.mjs",
+    "build:mobile": "npm run build && node scripts/stage-mobile.mjs",
+    "lint": "eslint . --quiet"
+  },
+  "keywords": [],
+  "author": "Bahadır Umut İşçimen",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bahadirumutiscimen/Comprehensible-Learning-Portal.git"
+  },
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^16.11.6",
+    "esbuild": "0.17.3",
+    "eslint": "^10.6.0",
+    "eslint-plugin-obsidianmd": "^0.4.1",
+    "obsidian": "latest",
+    "tslib": "2.4.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.62.1"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "^0.0.4",
+    "dompurify": "^3.4.11",
+    "jszip": "^3.10.1"
+  }
+}

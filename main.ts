@@ -1,0 +1,9148 @@
+import {
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	App,
+	ItemView,
+	WorkspaceLeaf,
+	FileSystemAdapter,
+	type ViewStateResult,
+	type ViewState,
+	TFile,
+	setIcon,
+	addIcon,
+	Notice,
+	SecretComponent,
+	TextAreaComponent,
+	TextComponent,
+	Modal,
+	SuggestModal,
+	Platform,
+	Scope,
+	apiVersion,
+	getLinkpath,
+	normalizePath,
+} from "obsidian";
+import JSZip from "jszip";
+import {
+	parseEpub,
+	renderSpineRange,
+	expandSelfClosingTags,
+	revokeImageUrls,
+	extractLinkPreview,
+	resolveEpubHref,
+	resolveRelativePath,
+	EpubBook,
+	EpubDrmError,
+	EpubTocItem,
+	type EpubLinkPreview,
+} from "./epub";
+import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
+import { isLocalEndpoint, probeProvider, starterModel, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
+import { listSpeechVoices, speakEnglishText } from "./speech";
+import { findFlaggedDocs, processPendingInFile } from "./ai-queue";
+import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
+import { type LibraryOverride, invalidateMetaCache, LIBRARY_ROOT, companionDocPath, sanitizeFileName } from "./library-scan";
+// Shared Gloss grammar — the annotation surface, saved-highlight model, and
+// companion-doc writers that the EPUB reader and the PDF controller both drive.
+import {
+	ANCHOR_PREFIX_LEN,
+	AnnotationPreview,
+	BOOKMARK_MODE,
+	GLOSS_AI_MODES,
+	GLOSS_MODES,
+	GlossSurface,
+	appendCallout,
+	applyGlossTheme,
+	type GlossHostSettings,
+	buildCallout,
+	calloutHeader,
+	ensureCompanionDoc,
+	getNavbarSlot,
+	getSafeViewport,
+	hitTestHighlightRects,
+	isTextInputFocused,
+	parseSavedHighlights,
+	registerTouchSelectionRaise,
+	type SavedHighlight,
+} from "./gloss";
+// The right-rail Highlights pane (Annotations / Conversations / AI chat). Owns
+// its own DOM and the whole AI-exchange path; ReaderView is its first host.
+import {
+	DEFAULT_SYSTEM_PROMPTS,
+	HighlightsPane,
+	buildGlossSystemPrompt,
+	makePaneResizable,
+	pickModel,
+	type AiPromptMode,
+	type HighlightsPaneHost,
+	type PaneTab,
+} from "./highlights-pane";
+import { PdfGlossManager } from "./pdf-gloss";
+import { ContentImportModal, type ImportProgress } from "./content-import";
+import {
+	CODEX_LEARNING_MODEL,
+	DEFAULT_TRANSLATION_SETTINGS,
+	type AgentCliBackend,
+	type TranslationSettings,
+} from "./translation-settings";
+import { canStartImportJob, createImportJob, patchImportJob, type ImportJob } from "./import-jobs";
+import {
+	translateUnits,
+	probeCodexCommand,
+	probeAgentCli,
+	type TranslationCacheEntry,
+	type TranslationPair,
+} from "./translation-service";
+import {
+	createBilingualBook,
+	decorateBilingualContent,
+	epubTranslationProgress,
+	extractEpubTranslationUnits,
+	type BilingualBookData,
+} from "./epub-translation";
+import {
+	buildStoryParagraphs,
+	captureYoutubeFrame,
+	detectTopicBoundaryStarts,
+	fetchYoutubePlaylistEntries,
+	fetchYoutubeTranscript,
+	fetchYoutubeTranscriptWithWhisper,
+	fetchYoutubeTranscriptWithYtDlp,
+	parseYoutubeInput,
+	probeLocalTool,
+	probeWhisperSetup,
+	renderYoutubeStoryEpub,
+	youtubeStoryCacheKey,
+	type YoutubeParagraph,
+	type YoutubeStoryCacheEntry,
+	type YoutubeTranscript,
+} from "./youtube";
+import { DEFAULT_YOUTUBE_SETTINGS, type YoutubePlaylistProgress, type YoutubeSettings } from "./youtube-settings";
+import { YOUTUBE_STORY_VIEW_TYPE, YoutubeStoryView } from "./youtube-view";
+import {
+	DEFAULT_STUDY_DATA,
+	DEFAULT_STUDY_PREFERENCES,
+	STUDY_VIEW_TYPE,
+	StudyView,
+	compareShadowing,
+	renderStudyMarkdown,
+	type StudyData,
+	type StudyPreferences,
+	type StudySource,
+	type ShadowingAttempt,
+} from "./study";
+import { analyzeGrammar, analyzeVocabulary } from "./learning-service";
+import {
+	DEFAULT_QUICK_LOOKUP_SETTINGS,
+	analyzeQuickLookup,
+	quickLookupCacheKey,
+	type QuickLookupCacheEntry,
+	type QuickLookupRequest,
+	type QuickLookupResult,
+	type QuickLookupSettings,
+} from "./quick-lookup";
+import {
+	LEGACY_PLUGIN_SOURCES,
+	buildMigrationPreview,
+	renderLegacyAnnotationBlock,
+	renderLegacyAnnotations,
+	stableHash,
+	vocabularyIdentity,
+	type MigrationHistoryEntry,
+	type MigrationPreview,
+} from "./migration";
+import { clampReaderFraction, readerScrollFraction, readerScrollOffset, readerSectionIndex } from "./reader-flow";
+// Bundled 3C typefaces (OFL/Apache). Imported as base64 data URLs (see
+// esbuild.config.mjs `dataurl` loader) so they ship inside main.js and render
+// for BRAT testers, whose vaults never receive the loose fonts/ folder.
+import RosarivoRegular from "./fonts/Rosarivo-Regular.ttf";
+import RosarivoItalic from "./fonts/Rosarivo-Italic.ttf";
+import LabradaRegular from "./fonts/Labrada-VariableFont_wght.ttf";
+import LabradaItalic from "./fonts/Labrada-Italic-VariableFont_wght.ttf";
+import KodeMono from "./fonts/KodeMono-VariableFont_wght.ttf";
+
+export const READER_VIEW_TYPE = "comprehensible-learning-portal";
+
+// Book search: shortest queryable string, total hits collected before bailing,
+// and how many rows actually render (the rest collapse into a "more" footer).
+const SEARCH_MIN_CHARS = 2;
+const SEARCH_MAX_HITS = 500;
+const SEARCH_RENDER_CAP = 100;
+
+interface ImportEntry {
+	folderPath: string;
+	name: string;
+	finalName: string;
+	checked: boolean;
+}
+
+interface AiDefaults {
+	/** Provider id used by default for new conversations. Null = no AI
+	 *  configured yet (Conversations tab still works for displaying past
+	 *  exchanges; new turns are blocked with an "configure AI provider"
+	 *  notice). */
+	primaryProviderId: string | null;
+}
+
+interface ComprehensibleLearningPortalSettings {
+	translation: TranslationSettings;
+	quickLookup: QuickLookupSettings;
+	quickLookupCache: Record<string, QuickLookupCacheEntry>;
+	migrationHistory: MigrationHistoryEntry[];
+	youtube: YoutubeSettings;
+	/** One-time migration marker for the playlist default. */
+	youtubeDefaultsVersion: number;
+	youtubeStoryCache: Record<string, YoutubeStoryCacheEntry>;
+	youtubePlaylistProgress: Record<string, YoutubePlaylistProgress>;
+	study: StudyData;
+	studyPreferences: StudyPreferences;
+	importJobs: ImportJob[];
+	translationCache: Record<string, TranslationCacheEntry>;
+	bilingualBooks: Record<string, BilingualBookData>;
+	clpMode: "obsidian" | "3c";
+	clpTheme: "light" | "dark";
+	/** Per-book memory, keyed by vault path. `Partial` because a PDF's entry has
+	 *  no epub position to store — only the page fraction (`pct`) and the
+	 *  right-rail tab; every reader read of a field already falls back. */
+	bookPositions: Record<string, Partial<ReaderPosition>>;
+	aiProviders: AiProvider[];
+	aiDefaults: AiDefaults;
+	/** Master switch for the AI surface. When off, the GlossBar shows only the
+	 *  Emphasise tile (Lite) and the Highlights pane hides its tab bar; when on,
+	 *  the AI Gloss modes + Conversations pane are available. Auto-enabled when
+	 *  the first provider is added; default off. */
+	aiFeaturesEnabled: boolean;
+	/** Stream AI responses token-by-token (local openai-compatible providers
+	 *  only — cloud kinds always buffer). On by default; surfaces a
+	 *  "Loading model…" → "Thinking…" → live-text progression in the chat. */
+	streaming: boolean;
+	/** Show AI-mode callouts in the Conversations list even when the user
+	 *  submitted no text and no AI turn followed (Exclaim/Enquiry edge cases).
+	 *  Toggled per-pane via the chat-box gear popover; off by default. */
+	showBareFlaggedConversations: boolean;
+	/** Mobile only: queue every AI submission into the companion doc for a
+	 *  desktop session to answer, even when a provider *is* reachable from the
+	 *  phone. Off by default — queueing is otherwise automatic and only happens
+	 *  when there is no provider to call. See the Mobile spec, Tier 1. */
+	deferAiToDesktop: boolean;
+	/** Editable system-prompt templates per AI Gloss mode. `{book}` is
+	 *  substituted with the book title; the selected passage is appended
+	 *  automatically by `buildAiSystemPrompt`. */
+	systemPrompts: Record<AiPromptMode, string>;
+	systemPromptVersion: number;
+	/** Per-book display overrides for title/author, keyed by vault path. The
+	 *  epub file is never modified — these only change how the Library renders
+	 *  (e.g. trimming a junk suffix baked into the OPF metadata). */
+	libraryOverrides: Record<string, LibraryOverride>;
+	/** User-defined order for Library collection tabs (excludes "Everything",
+	 *  which is always pinned leftmost). Also lets a freshly added but still-empty
+	 *  folder appear as a tab. */
+	libraryCollectionOrder: string[];
+	/** One-time flag: the Library shows a feedback hint above the settings gear on
+	 *  first load, then sets this so it never reappears. */
+	feedbackHintShown: boolean;
+	/** One-time flag: the "How to use the reader" help modal auto-opens the first
+	 *  time a book is opened, then sets this so it never auto-opens again. The
+	 *  help button (next to the ToC toggle) re-opens it on demand. */
+	helpShown: boolean;
+	/** Reader body text size in px, or `null` to follow Obsidian's own
+	 *  Appearance → Font size (the default). A sentinel rather than a number
+	 *  that happens to match: someone who sets 20 here and later moves the app
+	 *  to 22 should be able to get back to tracking without remembering what
+	 *  the app's value used to be. */
+	readerFontSize: number | null;
+	readerFlow: "paged" | "continuous";
+	onboardingVersion: number;
+	advancedSettingsVisible: boolean;
+	epubMarkdownExportFolder: string;
+}
+
+const DEFAULT_SETTINGS: ComprehensibleLearningPortalSettings = {
+	translation: { ...DEFAULT_TRANSLATION_SETTINGS },
+	quickLookup: { ...DEFAULT_QUICK_LOOKUP_SETTINGS },
+	quickLookupCache: {},
+	migrationHistory: [],
+	youtube: { ...DEFAULT_YOUTUBE_SETTINGS },
+	youtubeDefaultsVersion: 1,
+	youtubeStoryCache: {},
+	youtubePlaylistProgress: {},
+	study: { ...DEFAULT_STUDY_DATA },
+	studyPreferences: { ...DEFAULT_STUDY_PREFERENCES },
+	importJobs: [],
+	translationCache: {},
+	bilingualBooks: {},
+	clpMode: "obsidian",
+	clpTheme: "dark",
+	bookPositions: {},
+	aiProviders: [],
+	aiDefaults: { primaryProviderId: null },
+	aiFeaturesEnabled: false,
+	streaming: true,
+	showBareFlaggedConversations: false,
+	deferAiToDesktop: false,
+	systemPrompts: { ...DEFAULT_SYSTEM_PROMPTS },
+	systemPromptVersion: 3,
+	libraryOverrides: {},
+	libraryCollectionOrder: [],
+	feedbackHintShown: false,
+	helpShown: false,
+	readerFontSize: null,
+	readerFlow: "paged",
+	onboardingVersion: 0,
+	advancedSettingsVisible: false,
+	epubMarkdownExportFolder: "Library/Exports",
+};
+
+/** Bounds of the reader text-size override. Wider than Obsidian's own slider at
+ *  the top end: a two-page spread at 28px is a legitimate large-print layout,
+ *  and single-page mode catches it when the columns get too narrow. */
+const READER_FONT_MIN = 12;
+const READER_FONT_MAX = 28;
+
+/** Obsidian's Appearance → Font size, in px, clamped to the override's range.
+ *  Read from the live CSS variable rather than `appearance.json` so it tracks
+ *  pinch-to-zoom and Ctrl+scroll, which change it without touching the file. */
+function appTextSize(): number {
+	const raw = getComputedStyle(document.body).getPropertyValue("--font-text-size");
+	const size = parseFloat(raw);
+	const px = Number.isFinite(size) && size > 0 ? Math.round(size) : 16;
+	return Math.min(READER_FONT_MAX, Math.max(READER_FONT_MIN, px));
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Page-turns after a large jump before the return anchor expires and the
+ *  "Back" pill and its dot both go. Counted in either direction — see
+ *  `registerReadingTurn` for why. */
+const BACK_PILL_COMMIT_TURNS = 3;
+
+/** Inline SVG for the 3C logo (from Hipst3r-DLS/3CLibrary.pen, node 0goli).
+ *  Exported so the Library's 3C-mode toggle reuses the exact same mark. */
+export const LOGO_3C_SVG =
+	// width/height as well as viewBox: WebKit (iPad, iPhone — Obsidian mobile is
+	// a WKWebView, not Chromium) gives a viewBox-only inline SVG no intrinsic
+	// size, so as a flex item it can collapse instead of taking the size CSS
+	// asked for. Desktop Electron sizes it from the viewBox alone and never
+	// showed the problem. CSS still decides the rendered size.
+	'<svg viewBox="0 0 116 106" width="116" height="106" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+	'<path d="M93.18848 28.23926c13.49923 6.5209 22.81152 20.33795 22.81152 36.3291-0.00023 22.27106-18.06232 40.32514-40.34277 40.32519-8.60221 0-16.57421-2.69321-23.12207-7.27929 15.27594-1.13094 28.59509-9.2851 36.74804-21.24317-3.99014 4.82665-10.02286 7.90332-16.77441 7.90332-12.01438-0.00017-21.75391-9.74046-21.75391-21.75488 0.00017-12.01427 9.73963-21.75373 21.75391-21.7539 12.01442 0 21.75471 9.73953 21.75488 21.7539 0 2.69022-0.48997 5.26622-1.38281 7.64453 3.11907-6.43531 4.86914-13.65764 4.86914-21.28906-0.00001-7.37464-1.63689-14.36607-4.56152-20.63574z m-44.31348-28.23926c19.61829 0 36.53326 11.56047 44.31348 28.23926-5.30147-2.56091-11.24851-3.99705-17.53125-3.99707-22.28064 0-40.34277 18.05488-40.34278 40.32617 0.00014 13.67252 6.80903 25.75362 17.22071 33.0459-1.20835 0.08946-2.42894 0.13574-3.66016 0.13574-26.99292-0.00004-48.875-21.88206-48.875-48.875 0.00004-26.9929 21.8821-48.87496 48.875-48.875z"/>' +
+	'</svg>';
+
+interface ReaderSection {
+	id: string;
+	label: string;
+	tocHref: string;
+	startSpine: number;
+	endSpine: number;
+}
+
+/** EPUB converters occasionally leave a localized navigation stub (for
+ * example Cyrillic “Старт”) in the English book's ToC. Prefer the actual
+ * spine heading in that case, so the index and progress labels describe the
+ * text the learner is reading rather than the converter's placeholder. */
+function sectionDisplayLabel(book: EpubBook, tocLabel: string, spineIndex: number, ordinal: number): string {
+	const label = tocLabel.replace(/\s+/g, " ").trim();
+	const heading = book.spineLabels?.[spineIndex]?.replace(/\s+/g, " ").trim();
+	const suspicious = !label || /[\u0400-\u04ff]/u.test(label) || /^(?:c?tapt|start|contents?)$/iu.test(label);
+	if (suspicious && heading) return heading;
+	return label || heading || `Chapter ${ordinal + 1}`;
+}
+
+/** One registerable block of the book-search index. `paraId` is predicted to
+ *  match what prepareUnit stamps at mount (same walk, same filter), so a hit
+ *  can ride the saved-highlight jump path. */
+interface BookSearchEntry {
+	paraId: string;
+	sectionIdx: number;
+	text: string;
+	textLower: string;
+}
+
+interface BookSearchHit {
+	entry: BookSearchEntry;
+	start: number;
+	end: number;
+}
+
+interface RenderUnit {
+	id: string;
+	sectionIds: string[];
+	sectionOffsets: number[];
+	startSpine: number;
+	endSpine: number;
+	spreadCount: number;
+	/** True when this unit holds a single short section that couldn't be paired
+	 *  with an adjacent section. Renders as a centered single-column page
+	 *  rather than in the left column of an empty two-column spread. */
+	singlePage?: boolean;
+}
+
+interface ReaderPosition {
+	unitIndex: number;
+	spread: number;
+	/** Last-active right-rail tab for this book. Persisted across sessions
+	 *  so re-opening a book whose user was last on Conversations restores
+	 *  there. Optional for backward compat — Phase 2 stored positions
+	 *  without this field. */
+	pane?: "annotations" | "conversations";
+	/** Cached reading fraction (0..1), written on every position-save. The Library
+	 *  card reads this directly for its progress bar and never recomputes it.
+	 *  Optional for backward compat — books last read before Phase D lack it
+	 *  (the Library treats absent as "Unread"). */
+	pct?: number;
+	/** Epoch ms of the last position change, written alongside `pct`. Sorts the
+	 *  Library shelf most-recent-first. Absent on books never opened *and* on
+	 *  everything read before this shipped — both sort to the alphabetical tail,
+	 *  which is the pre-existing order, so no backfill is needed. */
+	lastRead?: number;
+}
+
+type LayoutMode = "spread" | "single";
+
+/** Persisted reader leaf state (getState/setState round-trip). Obsidian
+ *  sometimes hands the state back nested one level deep on tab restore,
+ *  hence the recursive `state` field. */
+interface ReaderViewState extends Record<string, unknown> {
+	file?: string;
+	unitIndex?: number;
+	spread?: number;
+	pct?: number;
+	state?: ReaderViewState;
+}
+
+/** A cheat-sheet row: a keycap, an optional colour-flagged mode label, and a
+ *  description. Recreated from the `HelpPopoup` component in the 3C Pencil DLS. */
+/** A row's leading chip is either a keycap (desktop) or the icon of the control
+ *  that does the same job (touch), never both — there are no keys to press on a
+ *  phone, and the icon is what the reader actually shows. */
+interface HelpRow {
+	key?: string;
+	icon?: string;
+	label?: { text: string; color: string };
+	desc: string;
+}
+
+const GLOSS_HELP_DESC: Record<string, string> = {
+	emphasise: "Plain highlight with annotation",
+	exclaim: "Capture a reaction as first AI turn",
+	explain: "Ask AI to clarify",
+	examine: "Ask the AI to explore, with citations",
+	enquiry: "Open back-and-forth conversation with AI",
+};
+
+/** Built from `GLOSS_MODES` rather than restated, so the help sheet cannot list
+ *  a mode, colour, icon or order the GlossBar doesn't have. The numeric keys are
+ *  positional for the same reason — `1`–`5` are bound by tile index. */
+function glossHelpRows(touch: boolean): HelpRow[] {
+	return [
+		{ key: "Select Text", desc: "Surfaces the Gloss toolbar over your selection" },
+		...GLOSS_MODES.map((m, i) => ({
+			...(touch ? { icon: m.icon } : { key: String(i + 1) }),
+			// Exclaim's tile fill (#7d2e2e) is a dark maroon meant to sit *behind*
+			// white text; as a label colour on the dark sheet it reads as a smudge,
+			// so it borrows the brighter icon token instead.
+			label: { text: m.label, color: `var(--clp-c-${m.id === "exclaim" ? "exclaim-icon" : m.id})` },
+			desc: GLOSS_HELP_DESC[m.id],
+		})),
+	];
+}
+
+/** Touch drops the keycaps entirely: page turns are tap zones (covered by the
+ *  intro copy), Escape has no equivalent, and the four remaining actions are
+ *  chrome buttons — so each row shows that button's own icon. Icon names come
+ *  from the controls themselves (`table-of-contents`, `clp-icon-book-search`,
+ *  `BOOKMARK_MODE.icon`, `pencil-line`). */
+function helpGroups(touch: boolean): { heading: string; rows: HelpRow[] }[] {
+	return [
+		{
+			heading: "Reading",
+			rows: touch
+				? [
+					{ icon: "table-of-contents", desc: "Table Of Contents" },
+					{ icon: "clp-icon-book-search", desc: "Search in book" },
+					{ icon: BOOKMARK_MODE.icon, desc: "Bookmark Current Page" },
+					{ icon: "pencil-line", desc: "Highlights & Annotations" },
+				]
+				: [
+					{ key: "← / →", desc: "Previous / Next Page" },
+					{ key: "t", desc: "Table Of Contents" },
+					{ key: "h", desc: "Highlights & Annotations" },
+					{ key: "b", desc: "Create or Remove Bookmark" },
+					{ key: "s", desc: "Search in book" },
+					{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
+				],
+		},
+		{ heading: "Annotating – Select Text, Then Press", rows: glossHelpRows(touch) },
+	];
+}
+
+/** "How to use the Reader" — a keyboard/action cheat sheet recreated from the
+ *  3C DLS `HelpPopoup` component. Auto-opens once on first book open (gated by
+ *  `settings.helpShown`); re-openable any time from the help button beside the
+ *  ToC toggle. Pure presentation — reads no plugin state. */
+class HelpModal extends Modal {
+	constructor(app: App, private glossSettings: GlossHostSettings) { super(app); }
+
+	onOpen(): void {
+		const { modalEl, contentEl } = this;
+		modalEl.addClass("clp-help-modal");
+		// Body-scoped like the gloss floaters, so it needs the same stamp to reach
+		// the DLS mode colours rather than Obsidian's theme reds and greens.
+		applyGlossTheme(modalEl, this.glossSettings);
+		contentEl.empty();
+
+		const touch = Platform.isMobile;
+		modalEl.toggleClass("clp-help-modal-touch", touch);
+
+		const header = contentEl.createDiv({ cls: "clp-help-header" });
+		header.createEl("h2", { cls: "clp-help-title", text: "How to use the Reader" });
+		header.createEl("p", {
+			cls: "clp-help-intro",
+			text: touch
+				? "Comprehensible Learning Portal has been adapted to work on Mobile & Tablet Devices. Tap on either side to navigate, and the centre to reveal the panel buttons."
+				: "Comprehensible Learning Portal is keyboard-first. Hover over the page to reveal the panel buttons, everything else is a keystroke away.",
+		});
+
+		for (const group of helpGroups(touch)) {
+			const section = contentEl.createDiv({ cls: "clp-help-section" });
+			section.createDiv({ cls: "clp-help-group", text: group.heading });
+			for (const row of group.rows) {
+				const rowEl = section.createDiv({ cls: "clp-help-row" });
+				const keycol = rowEl.createDiv({ cls: "clp-help-keycol" });
+				if (row.icon) {
+					const chip = keycol.createSpan({ cls: "clp-help-iconcap" });
+					setIcon(chip, row.icon);
+					// Mode rows tint the glyph; chrome rows stay muted, matching the
+					// buttons they stand for.
+					if (row.label) chip.style.color = row.label.color;
+				} else {
+					keycol.createSpan({ cls: "clp-help-keycap", text: row.key });
+				}
+				const desc = rowEl.createDiv({ cls: "clp-help-desc" });
+				if (row.label) {
+					const lbl = desc.createSpan({ cls: "clp-help-mode", text: row.label.text });
+					lbl.style.color = row.label.color;
+				}
+				desc.createSpan({ cls: "clp-help-action", text: row.desc });
+			}
+		}
+
+		contentEl.createEl("p", {
+			cls: "clp-help-foot",
+			text: touch
+				? "AI modes are opt-in and need a provider configured in settings."
+				: "Gloss shortcuts (1-5) only trigger while text is selected and toolbar is showing. AI modes need a provider configured in settings.",
+		});
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** The slice of Capacitor's native StatusBar plugin the reader uses. Obsidian
+ *  bundles Capacitor for its mobile app and it registers itself on the global
+ *  scope; none of this is part of the Obsidian plugin API, so everything that
+ *  touches it is optional and failure is always "the status bar stays visible". */
+interface CapacitorStatusBar {
+	hide?: () => Promise<void>;
+	show?: () => Promise<void>;
+}
+
+interface CapacitorGlobal {
+	Plugins?: { StatusBar?: CapacitorStatusBar };
+	registerPlugin?: (name: string) => CapacitorStatusBar;
+}
+
+// ─── REGION: ReaderView — Fields ────────────────────────────────────────────
+export class ReaderView extends ItemView {
+	private currentFile: TFile | null = null;
+	private book: EpubBook | null = null;
+
+	private spineIndex = 0;
+	private currentSpread = 0;
+	private currentUnitIndex = 0;
+	private totalSpreads = 1;
+	/** True once a unit has actually mounted for the current book. Guards the
+	 *  onClose position flush: a view closed mid-load (plugin reload/update
+	 *  tears views down while the async load is in flight) still sits at the
+	 *  0/0 reset values, and flushing those would overwrite the real stored
+	 *  position with {unitIndex: 0, spread: 0, pct: 1} — the "sent back to
+	 *  the start" poison. */
+	private hasMountedUnit = false;
+	/** Durable "where the user is" anchor — section index + in-section spread
+	 *  offset + that section's spread count — captured on every goToSpread,
+	 *  when the unit model is guaranteed valid. handleResize re-seeks from
+	 *  this instead of re-deriving from live model state: a resize pass can
+	 *  run while another pass holds this.units mid-rebuild (transiently
+	 *  empty), and deriving the section from an empty model fabricated
+	 *  "section 0" — the post-reload yank back to the cover. */
+	private posAnchor: { sectionIdx: number; offset: number; count: number } | null = null;
+	private tocAnchorPageMap: Array<{ spreadOffset: number; href: string }> = [];
+
+	/** Last text size `applyReaderFontSize` resolved, in px; 0 before the first
+	 *  call. Guards the repaginate so unrelated settings saves are free. */
+	private appliedFontSize = 0;
+
+	private tocOpen = false;
+
+	private resizeObserver: ResizeObserver | null = null;
+	private statusBarObserver: ResizeObserver | null = null;
+	private resizeTimer: number | null = null;
+	private continuousScrollRaf: number | null = null;
+	private chromeHideTimer: number | null = null;
+	/** Holds the phone caption's wording change until it has finished travelling
+	 *  — see `renderMobilePages`. */
+	private mobilePagesTimer: number | null = null;
+	/** Chrome state the caption's *current wording* was written for, which lags
+	 *  the class during the move. */
+	private mobilePagesChromeUp = false;
+	/** Where the current pointer gesture began, so the click that ends it can be
+	 *  classified as a tap or discarded as a drag. Null between gestures. */
+	private tapStart: { x: number; y: number; t: number } | null = null;
+	/** The footnote or citation whose floater a first tap has raised, so the next
+	 *  tap on it is understood as "follow it" rather than "show it again". Null
+	 *  whenever no reference floater is up. Touch only. */
+	private referenceTapEl: Element | null = null;
+	private isDraggingProgress = false;
+	private progressTooltipRaf: number | null = null;
+	private pendingProgressMouseEvent: MouseEvent | null = null;
+
+	private tooltipEl: HTMLElement | null = null;
+	private linkPreviewCache = new Map<string, EpubLinkPreview | null>();
+	private linkPreviewPending = new Map<string, Promise<EpubLinkPreview | null>>();
+	private hoveredLinkPreviewKey: string | null = null;
+	private previousPosition: ReaderPosition | null = null;
+	/** Page-turns since the current anchor was set, in either direction — see
+	 *  {@link BACK_PILL_COMMIT_TURNS}. */
+	private turnsSinceAnchor = 0;
+
+	private spreadEl: HTMLElement | null = null;
+	private contentNode: HTMLElement | null = null;
+	private cacheHost: HTMLElement | null = null;
+	private prevHost: HTMLElement | null = null;
+	private nextHost: HTMLElement | null = null;
+	private tocListEl: HTMLElement | null = null;
+	private tocTitleEl: HTMLElement | null = null;
+	/** Phone toolbar centre pill — the two labels that cross-fade in place:
+	 *  chapter while reading, book title while the chrome is up. Null on
+	 *  desktop in effect (the plate is `display: none` there), but built
+	 *  unconditionally so there's no platform branch in renderShell. */
+	private toolbarChapterEl: HTMLElement | null = null;
+	private toolbarBookEl: HTMLElement | null = null;
+	private progressBarEl: HTMLElement | null = null;
+	private progressTipEl: HTMLElement | null = null;
+	private globalPageEl: HTMLElement | null = null;
+	private localPageEl: HTMLElement | null = null;
+	/** Phone progress bar — one chapter-scoped track in place of the desktop
+	 *  segmented bar, plus the line of copy under it. See layoutMobileProgress. */
+	private mobileFillEl: HTMLElement | null = null;
+	private mobilePagesEl: HTMLElement | null = null;
+	private mobileLocalPage = 1;
+	private mobilePagesLeft = 0;
+
+	private measurementSpreadEl: HTMLElement | null = null;
+	private measurementContentEl: HTMLElement | null = null;
+	private measurementBucketKey = "";
+
+	private sections: ReaderSection[] = [];
+	private units: RenderUnit[] = [];
+	private sectionIndexById = new Map<string, number>();
+	private sectionIndexBySpine: number[] = [];
+	private unitIndexBySection = new Map<string, number>();
+	private sectionSpreadCounts: number[] = [];
+	private sectionColumnCounts: number[] = [];
+	private sectionStartSpreads: number[] = [];
+	private unitStartSpreads: number[] = [];
+	// Keyed `sectionId@geometryBucket`; persists across resizes (values are only
+	// valid for their own bucket by construction). Cleared on book change.
+	private spreadMeasureCache = new Map<string, { spreads: number; columns: number }>();
+	// Exact position per committed geometry bucket, saved when a resize leaves
+	// it. Fractional spread⇄page count ratios (7 spreads ⇄ 15 pages) make the
+	// scaled remap drift by one on round-trips; returning to a known bucket
+	// restores the exact spot instead. Cleared on book change.
+	private lastPositionByBucket = new Map<string, { unitIndex: number; spread: number }>();
+
+	// Unit DOM is geometry-independent (pretext prepares offsets from font
+	// metrics; pagination is CSS columns re-applied at mount), so the cache is
+	// keyed by spine range and survives resize rebuilds — only book load clears it.
+	private unitDomCache = new Map<string, HTMLElement>();
+	private mountedUnitKeys = { prev: "", next: "" };
+	private renderToken = 0;
+	/** Monotonic id for queued layout passes; a pass whose id is stale by the
+	 *  time it reaches the front of the chain is skipped (a newer one follows). */
+	private layoutPassId = 0;
+	/** Spread height captured just before the on-screen keyboard opens, held so
+	 *  the reading column's multicol box can't be re-flowed by the shrinking
+	 *  layout viewport. See freezeSpreadHeight. */
+	private frozenSpreadH = 0;
+	/** Serializes geometry passes (initial load + resize rebuilds) so they never
+	 *  interleave on the shared pagination model / measurement DOM. */
+	private layoutChain: Promise<void> = Promise.resolve();
+	private offsetMap = new OffsetMap();
+	private layoutMode: LayoutMode = "spread";
+	private appliedReaderFlow: "paged" | "continuous" = "paged";
+
+	/** The shared GlossBar / input / tooltip floaters. Constructed in `onOpen`
+	 *  and added as a child component, so its DOM and listeners die with the
+	 *  view. The PDF controller drives an identical instance. */
+	private glossSurface!: GlossSurface;
+	/** The right-rail Annotations / Conversations pane. Constructed in the
+	 *  constructor and added as a child component, so its DOM, listeners and
+	 *  in-flight AI stream die with the view. */
+	private pane!: HighlightsPane;
+	private highlightOverlayEl: HTMLElement | null = null;
+	private bookmarkToggleEl: HTMLElement | null = null;
+	/** Does the current spread carry a bookmark. Cached by `updateBookmarkButton`
+	 *  so the phone caption can read the answer rather than re-measuring every
+	 *  bookmark's rect a second time per navigation. */
+	private spreadBookmarked = false;
+	// Book search (see In-Book Search feature spec). The index promise is the
+	// lazy cache: built on first use per book, dropped in resetViewState.
+	private searchOpen = false;
+	private searchBarEl: HTMLElement | null = null;
+	private searchInputEl: HTMLInputElement | null = null;
+	private searchResultsEl: HTMLElement | null = null;
+	private searchQuery = "";
+	private searchDebounce: number | null = null;
+	private searchIndexPromise: Promise<BookSearchEntry[]> | null = null;
+	private searchHits: BookSearchHit[] = [];
+	/** Keyboard-focused result row (combobox pattern — DOM focus stays in the
+	 *  input; ↑/↓ move this index, Enter jumps). −1 = nothing focused. */
+	private searchActiveIdx = -1;
+	// Esc interception — a keymap Scope pushed while this reader is the active
+	// leaf, so layer dismissal preempts app/plugin hotkeys (see onOpen).
+	private escScope: Scope | null = null;
+	private escScopePushed = false;
+	private activeHighlight: CursorRange | null = null;
+	private activeSelectionText: string | null = null;
+	private activeSelectionRect: DOMRect | null = null;
+	private hoverLookupTimer: number | null = null;
+	/** Anchored cross-page selection. While `isExtending`, the start boundary is
+	 *  frozen in `extendAnchor` (a live DOM point — valid as long as the unit's
+	 *  DOM persists, i.e. within-unit page turns), the selection survives
+	 *  navigation, and the next reader click sets the far endpoint. */
+	private isExtending = false;
+	private extendAnchor: { node: Node; offset: number } | null = null;
+	private extendHintEl: HTMLElement | null = null;
+	private savedHighlights: SavedHighlight[] = [];
+	/** Shared hover-preview floater for saved highlights. Child component, so
+	 *  its DOM dies with the view; the PDF controller drives its own instance. */
+	private annotationPreview!: AnnotationPreview;
+
+	private positionSaveTimer: number | null = null;
+
+	private static readonly GAP = 48;
+	private static readonly SINGLE_PAGE_HYSTERESIS = 32;
+	/** Mobile width changes only in one discrete jump, on rotation, so desktop's
+	 *  anti-flap band becomes a liability: an iPad Air landscape (candidate 1045)
+	 *  sits inside the desktop band [1024, 1088], making the layout depend on
+	 *  whether you opened in landscape or rotated into it. A narrow band keeps
+	 *  orientation deterministic. */
+	private static readonly SINGLE_PAGE_MOBILE_HYSTERESIS = 8;
+	private static readonly SINGLE_PAGE_BREAK_RATIO = 0.72;
+	/** Minimum column measure for a mobile spread, in **em**, so it scales with
+	 *  Obsidian's text-size setting. Deliberately not the desktop breakpoint's
+	 *  `--file-line-width`, which is a *width* preference: on a device the
+	 *  question is whether two columns of readable measure fit at the text size
+	 *  chosen, so a reader on large type should get one column exactly where a
+	 *  reader on small type gets two. 25.5em is roughly 50 characters, a
+	 *  paperback measure; raise it toward that to push the iPad Mini back to
+	 *  single-page. */
+	private static readonly SINGLE_PAGE_MOBILE_MIN_COL_EM = 24;
+	private static readonly SINGLE_PAGE_MIN_SPREAD_COL = 420;
+	private static readonly SINGLE_PAGE_MAX_SPREAD_COL = 560;
+	/** How long the touch chrome reveal lingers before fading back out. Long
+	 *  enough to read the page counters and find a toggle, short enough that
+	 *  the buttons don't become permanent furniture over the text.
+	 *
+	 *  Held open for as long as a pane or the search bar is up — see
+	 *  `syncChromeHold`. */
+	private static readonly CHROME_AUTOHIDE_MS = 6000;
+	/** Mirrors `--clp-chrome-delay` and the two `--clp-chrome-move` values in
+	 *  styles.css, which own the phone progress bar's reveal. Summon and dismiss
+	 *  run at different lengths on purpose — see the note on the tokens.
+	 *
+	 *  Duplicated rather than read back from the computed style: this fires on
+	 *  every chrome toggle and the read would cost a style resolve to learn a
+	 *  constant. If the caption's wording changes before it lands, they've
+	 *  drifted. */
+	private static readonly MOBILE_CAPTION_DELAY_MS = 100;
+	private static readonly MOBILE_CAPTION_MOVE_IN_MS = 140;
+	private static readonly MOBILE_CAPTION_MOVE_OUT_MS = 240;
+	/** How far a finger may travel and how long it may rest before the gesture
+	 *  stops counting as a tap. Generous on both axes: a thumb reaching the far
+	 *  edge of a phone rolls several px, and a tap that misses becomes a page
+	 *  turn the reader didn't ask for. Drags fall through to selection. */
+	private static readonly TAP_SLOP_PX = 12;
+	private static readonly TAP_MAX_MS = 600;
+	/** Share of the reader's width each page-turn strip owns, leaving the middle
+	 *  third for the chrome toggle. See `tapZoneEdges`. */
+	private static readonly TAP_ZONE_SHARE = 1 / 3;
+	private static readonly TOOLTIP_MAX_CHARS = 900;
+	private static readonly TOOLTIP_MARGIN = 16;
+	private static readonly TOOLTIP_OFFSET_X = 14;
+	private static readonly TOOLTIP_OFFSET_Y = 18;
+
+	// ─── REGION: Lifecycle ───────────────────────────────────────────────────
+	constructor(leaf: WorkspaceLeaf, private plugin: ComprehensibleLearningPortal) {
+		super(leaf);
+		// Built here rather than in onOpen so `applyAiFeaturesState` (which
+		// `saveSettings` fans out to every open view) can never race ahead of it.
+		this.glossSurface = new GlossSurface({
+			app: this.app,
+			settings: () => this.plugin.settings,
+			sourcePath: () => this.getCompanionDocPath() ?? "",
+			onExtend: () => this.beginExtend(),
+			onSpeak: () => this.speakSelection(),
+			onSaveVocabulary: () => this.saveSelectionToVocabulary(),
+			onSaveGrammar: () => this.saveSelectionToGrammar(),
+			onSaveShadowing: () => this.saveSelectionToShadowing(),
+			getQuickLookupRequest: () => this.selectionQuickLookupRequest(),
+			onQuickLookup: (request) => this.plugin.quickLookup(request),
+			onSaveQuickLookupVocabulary: (request, result) => this.saveQuickLookupVocabulary(request, result),
+			onSubmit: (mode, text) => this.onGlossSubmit(mode, text),
+			onDismiss: () => this.dismissGloss(),
+			onInputOpen: () => this.syncScrim(),
+		});
+		this.addChild(this.glossSurface);
+		this.annotationPreview = new AnnotationPreview(() => this.plugin.settings);
+		this.addChild(this.annotationPreview);
+		this.pane = new HighlightsPane(this.paneHost());
+		this.addChild(this.pane);
+	}
+
+	private speakSelection(): void {
+		const text = this.activeSelectionText?.trim();
+		if (!text) return;
+		speakEnglishText(text, this.plugin.settings.quickLookup.voiceLocale, this.plugin.settings.quickLookup.speechRate, this.plugin.settings.quickLookup.voiceName);
+	}
+
+	private saveSelectionToVocabulary(): void {
+		const term = this.activeSelectionText?.trim();
+		const source = term ? this.selectionStudySource(term) : null;
+		if (term && source) void this.plugin.addVocabulary(term, source);
+	}
+
+	private saveSelectionToGrammar(): void {
+		const text = this.activeSelectionText?.trim();
+		const source = text ? this.selectionStudySource(text) : null;
+		if (text && source) void this.plugin.addGrammar(text, source);
+	}
+
+	private saveSelectionToShadowing(): void {
+		const text = this.activeSelectionText?.trim();
+		const source = text ? this.selectionStudySource(text) : null;
+		if (text && source) void this.plugin.addShadowing(text, source);
+	}
+
+	async exportBilingualMarkdown(): Promise<void> {
+		if (!this.currentFile) return;
+		try {
+			const path = await this.plugin.exportBilingualEpubMarkdown(this.currentFile.path);
+			new Notice(`Çift dilli Markdown dışa aktarıldı: ${path}`);
+		} catch (error) {
+			new Notice(`EPUB dışa aktarılamadı: ${errorMessage(error)}`);
+		}
+	}
+
+	private selectionQuickLookupRequest(): QuickLookupRequest | null {
+		const text = this.activeSelectionText?.normalize("NFKC").replace(/\s+/g, " ").trim();
+		if (!text) return null;
+		const context = this.activeHighlight
+			? (this.offsetMap.get(this.activeHighlight.paraId)?.text ?? text)
+			: text;
+		return { text, context, kind: this.quickLookupKind(text) };
+	}
+
+	private saveQuickLookupVocabulary(request: QuickLookupRequest, result: QuickLookupResult): void {
+		const source = this.selectionStudySource(request.context);
+		if (!source) return;
+		source.context = request.context;
+		void this.plugin.addVocabulary(request.text, source, {
+			lemma: result.lemma || request.text,
+			ipa: result.ipa,
+			partOfSpeech: result.partOfSpeech,
+			turkish: result.meaning,
+			explanation: result.explanation,
+		});
+	}
+
+	private selectionStudySource(fallback: string): StudySource | null {
+		const path = this.currentFile?.path;
+		if (!path) return null;
+		return {
+			kind: "epub",
+			path,
+			label: this.book?.title ?? this.currentFile?.basename ?? path,
+			context: this.activeHighlight ? (this.offsetMap.get(this.activeHighlight.paraId)?.text ?? fallback) : fallback,
+		};
+	}
+
+	private savedHighlightStudySource(saved: SavedHighlight): StudySource | null {
+		const path = this.currentFile?.path;
+		if (!path) return null;
+		return {
+			kind: "epub",
+			path,
+			label: this.book?.title ?? this.currentFile?.basename ?? path,
+			context: saved.quote,
+			bridgeId: [
+				path,
+				saved.paraIdHint,
+				saved.endParaIdHint ?? "",
+				saved.startChar,
+				saved.endChar,
+				saved.mode,
+				saved.prefix,
+			].join("|"),
+		};
+	}
+
+	/** The book-shaped seam the Highlights pane reads the reader through: the
+	 *  saved-highlight list, spine-section grouping, navigation, and where the
+	 *  companion doc lives. A PDF host supplies the same shape with pages. */
+	private paneHost(): HighlightsPaneHost {
+		return {
+			app: this.app,
+			settings: () => this.plugin.settings,
+			saveSettings: () => this.plugin.saveSettings(),
+			savedHighlights: () => this.savedHighlights,
+			companionDocPath: () => this.getCompanionDocPath(),
+			sectionOf: (saved) => {
+				const match = /^s(\d+)-p(\d+)$/.exec(saved.paraIdHint);
+				const spineIdx = match ? parseInt(match[1], 10) : 0;
+				const paraIdx = match ? parseInt(match[2], 10) : 0;
+				const section = this.sections[this.sectionIndexBySpine[spineIdx] ?? 0];
+				return { id: section?.id ?? "", label: section?.label ?? "—", spineIdx, paraIdx };
+			},
+			repaintHighlights: () => this.renderSavedHighlights(),
+			jumpToSource: (idx, closePanel) => void this.jumpToHighlight(idx, closePanel),
+			buildAiSystemPrompt: (saved) => this.buildAiSystemPrompt(saved),
+			persistTab: (tab) => this.persistPaneTab(tab),
+			restoreTab: () => {
+				const path = this.currentFile?.path;
+				return path ? this.plugin.settings.bookPositions[path]?.pane : undefined;
+			},
+			showCitationTooltip: (text, e) => this.renderTooltip({ kind: "text", text }, e),
+			hideCitationTooltip: () => this.hideTooltip(),
+			onPanelToggle: (open) => {
+				// The panel slides over the bookmark toggle's corner, and the
+				// toggle outranks it on z-index (25 vs 20) — so it has to be
+				// hidden explicitly, the same way the pane hides its own toggle.
+				this.bookmarkToggleEl?.toggleClass("clp-chrome-btn-hidden", open);
+				// The bar lives in the opposite corner now and stays put. This
+				// covers the one route that opens the pane without a click:
+				// the palette command driven purely by keyboard, which leaves an
+				// open results card (z-index 24) floating over the panel (20).
+				// Every other route goes through a click, and the document
+				// mousedown handler has already collapsed the search by then.
+				if (open && this.searchOpen) this.toggleBookSearch(false);
+				this.syncPaneOpen();
+			},
+			makeResizable: (panel, edge) => this.makePaneResizable(panel, edge),
+			saveVocabulary: (saved) => {
+				const source = this.savedHighlightStudySource(saved);
+				if (source && saved.quote.trim()) void this.plugin.addVocabulary(saved.quote, source);
+			},
+			saveGrammar: (saved) => {
+				const source = this.savedHighlightStudySource(saved);
+				if (source && saved.quote.trim()) void this.plugin.addGrammar(saved.quote, source);
+			},
+			saveShadowing: (saved) => {
+				const source = this.savedHighlightStudySource(saved);
+				if (source && saved.quote.trim()) void this.plugin.addShadowing(saved.quote, source);
+			},
+		};
+	}
+
+	getViewType(): string {
+		return READER_VIEW_TYPE;
+	}
+
+	getDisplayText(): string {
+		return this.currentFile?.basename ?? "Comprehensible Learning Portal";
+	}
+
+	getIcon(): string {
+		return "book-open";
+	}
+
+	async onOpen(): Promise<void> {
+		this.resizeObserver = new ResizeObserver(() => {
+			if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
+			this.resizeTimer = window.setTimeout(() => {
+				this.resizeTimer = null;
+				this.queueResize();
+			}, 250);
+		});
+
+		const statusBar = document.querySelector<HTMLElement>(".status-bar");
+		if (statusBar) {
+			this.statusBarObserver = new ResizeObserver(() => {
+				const h = statusBar.getBoundingClientRect().height;
+				this.containerEl.style.setProperty("--status-bar-height", `${h}px`);
+			});
+			this.statusBarObserver.observe(statusBar);
+			// Seed immediately so panels have the correct value on first render.
+			this.containerEl.style.setProperty(
+				"--status-bar-height",
+				`${statusBar.getBoundingClientRect().height}px`
+			);
+		}
+
+		this.renderShell();
+
+		this.registerDomEvent(document, "mouseup", () => {
+			this.isDraggingProgress = false;
+		});
+
+		// Touch selection has no usable mouseup — see `registerTouchSelectionRaise`,
+		// which owns the debounce and is shared with the PDF host.
+		registerTouchSelectionRaise(this, this.glossSurface, () => this.raiseGlossForSelection());
+
+		if (Platform.isMobile) {
+			// Anything taking text focus is about to raise the keyboard and shrink
+			// the layout viewport out from under the reading column. Freeze first:
+			// `focusin` beats the keyboard animation, whereas the resize that
+			// follows is already measuring the collapsed box.
+			this.registerDomEvent(document, "focusin", () => {
+				if (isTextInputFocused()) this.freezeSpreadHeight();
+				this.syncPaneChrome();
+			});
+			// focusout fires before focus lands anywhere, so the settled state is
+			// only readable a tick later.
+			this.registerDomEvent(document, "focusout", () => {
+				window.setTimeout(() => this.syncPaneChrome(), 0);
+			});
+		}
+
+		// Escape must beat app/plugin hotkeys, and a DOM listener can never win
+		// that race — Obsidian's keymap listens on `window` in the CAPTURE phase,
+		// registered at boot. So go through the keymap itself: a Scope pushed
+		// while this reader is the active leaf. The handler is a CATCH-ALL (null
+		// key) on purpose — a specific-key registration terminates the scope
+		// chain even when it declines, swallowing Esc app-wide while reading.
+		// Dismissal runs one layer per press, in transience order, and fires even
+		// while a panel input has focus (scope follows the leaf, not DOM focus).
+		this.escScope = new Scope(this.app.scope);
+		this.escScope.register(null, null, (_evt, ctx) => {
+			if (ctx.key !== "Escape") return;
+			if (this.isGlossActive()) this.dismissGloss();
+			else if (this.searchOpen) this.toggleBookSearch(false);
+			else if (this.tocOpen) this.toggleToc();
+			else if (this.pane.isOpen) this.pane.toggle();
+			else return;
+			return false; // consumed — keymap preventDefaults and stops here
+		});
+		this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
+			this.syncEscScope();
+			// The immersive class lives on the body, so switching to a note must
+			// hand the navbar back rather than leave it hidden over someone else's
+			// view. syncMobileChrome checks whether this reader is still active.
+			this.syncMobileChrome();
+		}));
+		this.syncEscScope();
+
+		// Reader bare-key shortcuts (t / h / s / 1–5 / ← / →) are handled HERE,
+		// scoped to this view, and deliberately NOT as Obsidian commands: command
+		// hotkeys are global, so a bare key (especially an arrow) would steal the
+		// keystroke from the editor app-wide. Only modifier combos are safe as
+		// commands — those live in `addReaderCommands`.
+		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => {
+			if (this.app.workspace.getActiveViewOfType(ReaderView) !== this) return;
+			// While a text field (gloss input, note editor, chat box, search…) has
+			// focus, keystrokes belong to it: navigation and shortcuts yield.
+			const typing = isTextInputFocused();
+			// GlossBar numeric shortcuts (1–5): only over a live selection.
+			if (
+				!typing &&
+				!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey &&
+				/^[1-5]$/.test(e.key)
+			) {
+				const mode = this.glossShortcutMode(parseInt(e.key, 10));
+				if (mode) {
+					e.preventDefault();
+					e.stopPropagation();
+					this.openGlossInput(mode);
+					return;
+				}
+			}
+			if (
+				!typing && (e.key === "l" || e.key === "L") &&
+				!e.ctrlKey && !e.metaKey && !e.altKey && this.activeHighlight
+			) {
+				e.preventDefault();
+				e.stopPropagation();
+				this.openQuickLookupForSelection();
+				return;
+			}
+			if (!typing && e.key === "ArrowRight") void this.advance();
+			if (!typing && e.key === "ArrowLeft") void this.retreat();
+			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s" || e.key === "b")
+				&& !e.ctrlKey && !e.metaKey && !e.altKey) {
+				// preventDefault matters for `s`: the toggle focuses the search
+				// input, and without it this same keystroke's default action
+				// types an "s" into the field it just opened.
+				e.preventDefault();
+				if (e.key === "t") this.toggleToc();
+				else if (e.key === "h") this.pane.toggle();
+				else if (e.key === "b") void this.toggleBookmark();
+				else this.toggleBookSearch();
+			}
+		});
+
+		// Touch two-step for saved highlights: a tap on a rect raises the preview,
+		// a tap on the preview opens the conversation, anything else puts it away.
+		// Bound on document because the floater lives on document.body, outside
+		// the reader's tree, and document is the last stop in the bubble path.
+		// The `defaultPrevented` guard stops the raise undoing itself — the tap
+		// that raises the preview lands on a paragraph, not on the preview.
+		if (Platform.isMobile) {
+			this.registerDomEvent(document, "click", (e: MouseEvent) => {
+				if (e.defaultPrevented) return;
+				if ((e.target as Element | null)?.closest(".clp-annotation-preview")) {
+					this.openConversationFromPreview();
+				} else {
+					this.hideAnnotationPreview();
+					this.hideTooltip();
+				}
+			});
+		}
+
+		this.registerDomEvent(document, "mousedown", (e: MouseEvent) => {
+			// Book search: a click outside the bar and the results card
+			// collapses both.
+			if (this.searchOpen) {
+				const t = e.target as Node;
+				if (!this.searchBarEl?.contains(t) && !this.searchResultsEl?.contains(t)) {
+					this.toggleBookSearch(false);
+				}
+			}
+			// The end-click of an extend is resolved on mouseup — never dismiss it.
+			if (this.isExtending) return;
+			// Shift-click extends the live selection (browser handles the range
+			// growth); dismissing here would wipe it before it can extend.
+			if (e.shiftKey) return;
+			if (!this.isGlossActive()) return;
+			const target = e.target as Node;
+			if (this.glossSurface.containsNode(target)) return;
+			// The wikilink popover lives on document.body, outside the panel —
+			// a click there is a suggestion pick, not an outside click.
+			if (
+				this.glossSurface.suggestOpen &&
+				target instanceof Element &&
+				target.closest(".suggestion-container")
+			)
+				return;
+			this.dismissGloss();
+		});
+	}
+
+	/** Push/pop the Esc scope so it's active exactly while this reader is the
+	 *  active leaf. `popScope` tolerates out-of-order removal (drops the scope
+	 *  from the stack even when it isn't on top), so overlapping reader tabs
+	 *  can't corrupt the keymap stack. */
+	private syncEscScope(): void {
+		if (!this.escScope) return;
+		const active = this.app.workspace.getActiveViewOfType(ReaderView) === this;
+		if (active === this.escScopePushed) return;
+		this.escScopePushed = active;
+		if (active) this.app.keymap.pushScope(this.escScope);
+		else this.app.keymap.popScope(this.escScope);
+	}
+
+	async onClose(): Promise<void> {
+		if (this.escScopePushed && this.escScope) this.app.keymap.popScope(this.escScope);
+		this.escScopePushed = false;
+		this.escScope = null;
+		this.pane.abortActiveStream();
+		this.resizeObserver?.disconnect();
+		this.resizeObserver = null;
+		this.statusBarObserver?.disconnect();
+		this.statusBarObserver = null;
+		if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
+		if (this.continuousScrollRaf !== null) cancelAnimationFrame(this.continuousScrollRaf);
+		this.continuousScrollRaf = null;
+		if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
+		this.chromeHideTimer = null;
+		if (this.mobilePagesTimer !== null) window.clearTimeout(this.mobilePagesTimer);
+		this.mobilePagesTimer = null;
+		this.tapStart = null;
+		// Leaving the reader must never strand the user in a view with no navbar —
+		// and now that the hidden state is a body class we own outright, nothing
+		// else will ever take it off. Restored unconditionally rather than via
+		// syncMobileChrome(), which reads our chrome class and would do precisely
+		// the wrong thing on the way out.
+		this.contentEl.removeClass("clp-chrome-visible");
+		if (Platform.isMobile) {
+			document.body.removeClass("clp-immersive");
+			// Unconditional, not phone-gated: a no-op where we never hid it, and
+			// the one place a stuck status bar could outlive the reader.
+			ReaderView.setStatusBarHidden(false);
+		}
+		if (this.book) revokeImageUrls(this.book);
+		this.linkPreviewCache.clear();
+		this.linkPreviewPending.clear();
+		this.hoveredLinkPreviewKey = null;
+		this.tooltipEl?.remove();
+		this.extendHintEl?.remove();
+		this.extendHintEl = null;
+		this.isExtending = false;
+		this.extendAnchor = null;
+		this.annotationPreview.hide();
+		this.clearHighlightOverlay();
+		if (this.progressTooltipRaf !== null) cancelAnimationFrame(this.progressTooltipRaf);
+		this.progressTooltipRaf = null;
+		// Flush any pending debounced save so the last position isn't lost on close.
+		if (this.positionSaveTimer !== null) {
+			window.clearTimeout(this.positionSaveTimer);
+			this.positionSaveTimer = null;
+		}
+		const closePath = this.currentFile?.path;
+		// hasMountedUnit: never flush the 0/0 reset values of a view that got
+		// closed before its load finished — see the field doc.
+		if (closePath && this.book && this.hasMountedUnit) {
+			this.writeBookPosition(closePath);
+			void this.plugin.persistSettings();
+		}
+		this.contentEl.empty();
+	}
+
+	async setState(state: unknown, result: ViewStateResult): Promise<void> {
+		const s = (state ?? {}) as ReaderViewState;
+		const filePath = s.state?.file ?? s.file;
+		if (filePath) {
+			const incomingUnit = s.state?.unitIndex ?? s.unitIndex;
+			const incomingSpread = s.state?.spread ?? s.spread;
+			const incomingPct = s.state?.pct ?? s.pct;
+			const storedPos = this.plugin.settings.bookPositions[filePath];
+			// bookPositions outranks the leaf's serialized position. The workspace
+			// snapshot goes stale the moment a page turns (page turns never
+			// requestSaveLayout), and on plugin reload/update Obsidian rebuilds the
+			// leaf from that snapshot — trusting its defined-but-stale zeros sent
+			// readers back to the cover on every update. bookPositions is flushed
+			// within 800ms of every turn and again on close, so it is always at
+			// least as fresh as anything the layout can hand us.
+			const savedUnitIndex: number = storedPos?.unitIndex ?? incomingUnit ?? 0;
+			const savedSpread: number = storedPos?.spread ?? incomingSpread ?? 0;
+
+			// Tab-restore: this view already has the same epub loaded.
+			// Just seek to the saved position — no reload, no new-tab redirect.
+			const alreadyLoaded = this.book !== null && this.currentFile?.path === filePath;
+			if (alreadyLoaded) {
+				// If the restore state doesn't carry a real position, keep the
+				// live position rather than remounting at spread 0. Obsidian
+				// sometimes hands us a bare { file } state on tab activation
+				// — trusting the ?? 0 fallback there would throw the reader
+				// back to the cover after the user has navigated into the book.
+				const hasPosition = incomingUnit !== undefined || incomingSpread !== undefined || incomingPct !== undefined;
+				if (hasPosition) {
+					if (this.isContinuousFlow() && typeof (storedPos?.pct ?? incomingPct) === "number") {
+						const restorePct = storedPos?.pct ?? incomingPct ?? 0;
+						this.scrollContinuousToFraction(restorePct, "auto");
+						this.syncContinuousPosition();
+						this.updateProgress();
+						this.queueContinuousRestore(restorePct);
+					} else {
+						await this.mountCurrentUnit(savedUnitIndex, savedSpread);
+					}
+				}
+				await super.setState(state, result);
+				// ItemView state restoration can run after the subclass has set the
+				// scroll position. Re-assert it once the base view has finished so a
+				// stale browser/Obsidian scroll offset cannot win the race.
+				if (hasPosition && this.isContinuousFlow() && typeof (storedPos?.pct ?? incomingPct) === "number") {
+					this.queueContinuousRestore(storedPos?.pct ?? incomingPct ?? 0);
+				}
+				return;
+			}
+
+			// First open (Obsidian opened the epub, not us). Two cases:
+			if (!this.plugin._openingEpub) {
+				// Undocumented but stable leaf-internal history — the only way to
+				// know whether this leaf held content before the epub landed in it.
+				const hist = (this.leaf as unknown as { history?: { back?: { state: ViewState }[] } }).history;
+				if (hist?.back?.length) {
+					// The leaf already holds content the user navigated to (e.g. Cmd+O
+					// replacing the active tab). Don't clobber it: open the book in a
+					// dedicated tab and revert this leaf to where it was.
+					const originatingLeaf = this.leaf;
+					const restoreState = hist.back[hist.back.length - 1].state;
+					void this.plugin.openEpubInNewTab(filePath);
+					setTimeout(() => {
+						void originatingLeaf.setViewState(restoreState);
+					}, 0);
+					return;
+				}
+				// Otherwise this is a fresh, history-less leaf (Shift+Cmd+T restore or
+				// new-tab open): nothing to preserve, so load in place. Redirecting
+				// to a new tab instead races under rapid restores, stranding an
+				// orphaned "Opening…" tab.
+			}
+
+			const node = this.app.vault.getAbstractFileByPath(filePath);
+			if (node instanceof TFile) {
+				this.currentFile = node;
+				const restorePct = storedPos?.pct ?? incomingPct;
+				await this.loadFile(node, { unitIndex: savedUnitIndex, spread: savedSpread, pct: restorePct });
+				if (this.isContinuousFlow() && typeof restorePct === "number") this.queueContinuousRestore(restorePct);
+			}
+		}
+		await super.setState(state, result);
+	}
+
+	getState(): ReaderViewState {
+		return {
+			file: this.currentFile?.path,
+			unitIndex: this.currentUnitIndex,
+			spread: this.currentSpread,
+			pct: this.getProgressFraction(),
+		};
+	}
+
+	// ─── REGION: Theme ───────────────────────────────────────────────────────
+	/** Push the reader text-size setting onto the view root as `--clp-font-size`,
+	 *  or clear it when following Obsidian's own size. Repaginates only when the
+	 *  *resolved* size actually moved: this runs from `saveSettings`, which fires
+	 *  for every settings change, and rebuilding a book because someone toggled
+	 *  streaming would be absurd. Measured rather than compared against the
+	 *  stored setting, so switching the override off at a value equal to the
+	 *  app's is correctly a no-op. */
+	applyReaderFontSize(): void {
+		const override = this.plugin.settings.readerFontSize;
+		if (typeof override === "number") {
+			this.contentEl.style.setProperty("--clp-font-size", `${override}px`);
+		} else {
+			this.contentEl.style.removeProperty("--clp-font-size");
+		}
+		const resolved = Math.round(this.getSpreadFontSize());
+		if (resolved === this.appliedFontSize) return;
+		const first = this.appliedFontSize === 0;
+		this.appliedFontSize = resolved;
+		// No book on screen yet (renderShell) — the load that follows measures at
+		// the new size anyway, so a layout pass here would be wasted work.
+		if (!first) this.queueResize();
+	}
+
+	applyThemeClasses(): void {
+		const root = this.contentEl;
+		if (!root.classList.contains("clp-root")) return;
+		applyGlossTheme(root, this.plugin.settings);
+		// Body-scoped floaters stamped once at creation also need to track later
+		// mode/theme flips — the extend hint in particular is created lazily and
+		// then cached for the life of the view.
+		applyGlossTheme(this.tooltipEl, this.plugin.settings);
+		applyGlossTheme(this.extendHintEl, this.plugin.settings);
+		this.glossSurface.syncTheme();
+		this.annotationPreview.syncTheme();
+		this.pane.syncTheme();
+		this.updateTocFooter();
+		requestAnimationFrame(() => this.renderSavedHighlights());
+	}
+
+	applyTranslationSettings(): void {
+		const { viewMode, bilingualLayout } = this.plugin.settings.translation;
+		this.contentEl.removeClass(
+			"clp-translation-source",
+			"clp-translation-bilingual",
+			"clp-translation-target",
+			"clp-bilingual-auto",
+			"clp-bilingual-horizontal",
+			"clp-bilingual-vertical",
+		);
+		this.contentEl.addClass(`clp-translation-${viewMode}`, `clp-bilingual-${bilingualLayout}`);
+		this.updateTocFooter();
+		// View mode and bilingual layout are CSS state. Reopening the EPUB here
+		// used to put a fresh `Opening…` shell on screen for every click (and
+		// several rapid clicks could start overlapping full-book loads). Imported
+		// translations still call refreshBilingualContent explicitly; changing
+		// the display mode itself never needs a reload.
+	}
+
+	private isContinuousFlow(): boolean {
+		return this.appliedReaderFlow === "continuous";
+	}
+
+	applyReaderFlowSetting(): void {
+		const next = this.plugin.settings.readerFlow;
+		if (next === this.appliedReaderFlow) return;
+		const pct = this.getProgressFraction();
+		this.appliedReaderFlow = next;
+		this.contentEl.toggleClass("clp-flow-continuous", next === "continuous");
+		const file = this.currentFile;
+		if (file && this.book) {
+			void this.loadFile(file, {
+				unitIndex: this.currentUnitIndex,
+				spread: this.currentSpread,
+				pct,
+			});
+		}
+	}
+
+	refreshBilingualContent(): void {
+		this.unitDomCache.clear();
+		this.spreadMeasureCache.clear();
+		this.offsetMap.clear();
+		this.mountedUnitKeys = { prev: "", next: "" };
+		if (this.book && this.currentFile && this.isContinuousFlow()) {
+			const pct = this.getProgressFraction();
+			void this.loadFile(this.currentFile, { unitIndex: this.currentUnitIndex, spread: 0, pct });
+		} else if (this.book) {
+			this.queueResize();
+		}
+	}
+
+	private updateTocFooter(): void {
+		const modeBtn = this.contentEl.querySelector<HTMLElement>(".clp-toc-mode-btn");
+		const themeBtn = this.contentEl.querySelector<HTMLElement>(".clp-toc-theme-btn");
+		const translationBtn = this.contentEl.querySelector<HTMLElement>(".clp-toc-translation-btn");
+		const layoutBtn = this.contentEl.querySelector<HTMLElement>(".clp-toc-layout-btn");
+		if (!modeBtn || !themeBtn) return;
+		const { clpMode, clpTheme } = this.plugin.settings;
+		modeBtn.toggleClass("clp-toc-footer-btn-active", clpMode === "3c");
+		modeBtn.ariaLabel = clpMode === "3c" ? "3C mode (on)" : "3C mode (off)";
+		themeBtn.toggleClass("clp-hidden", clpMode !== "3c");
+		themeBtn.empty();
+		setIcon(themeBtn, clpTheme === "dark" ? "sun" : "moon");
+		themeBtn.ariaLabel = clpTheme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+		if (translationBtn) {
+			const labels = { source: "Yalnızca İngilizce", bilingual: "İngilizce ve Türkçe", target: "Yalnızca Türkçe" };
+			translationBtn.ariaLabel = labels[this.plugin.settings.translation.viewMode];
+			translationBtn.dataset.mode = this.plugin.settings.translation.viewMode;
+		}
+		if (layoutBtn) {
+			const layout = this.plugin.settings.translation.bilingualLayout;
+			const horizontal = layout !== "vertical";
+			setIcon(layoutBtn, horizontal ? "columns-2" : "rows-2");
+			layoutBtn.ariaLabel = horizontal
+				? "Çift dilli düzen: Yan yana (değiştirmek için tıkla)"
+				: "Çift dilli düzen: Alt alta (değiştirmek için tıkla)";
+			layoutBtn.dataset.layout = horizontal ? "horizontal" : "vertical";
+		}
+	}
+
+	// ─── REGION: Shell & TOC ─────────────────────────────────────────────────
+	private renderShell(): void {
+		this.tocOpen = false;
+		const root = this.contentEl;
+		root.empty();
+		root.addClass("clp-root");
+		this.appliedReaderFlow = this.plugin.settings.readerFlow;
+		root.toggleClass("clp-flow-continuous", this.isContinuousFlow());
+		this.applyTranslationSettings();
+		// Before the first paint, so the book is measured at its final text size
+		// rather than laid out at Obsidian's and repaginated a frame later.
+		this.applyReaderFontSize();
+		// Survive `empty()` — the controls they hide are about to be rebuilt.
+		root.removeClass("clp-pane-open");
+		root.removeClass("clp-search-open");
+		root.createEl("div", { cls: "clp-loading", text: "Opening…" });
+
+		// Phone toolbar. Deliberately a sibling, not a wrapper: the four corner
+		// controls keep their own absolute positions, and this is only the plate
+		// filling the strip between them. Being a sibling also leaves the search
+		// bar's morph and the pane's toggle mounting untouched. Created before
+		// the controls so it sits under them in paint order as well as z-index,
+		// and it's `pointer-events: none` — never a tap target.
+		const toolbar = root.createEl("div", { cls: "clp-toolbar" });
+		const toolbarTitle = toolbar.createEl("div", { cls: "clp-toolbar-title" });
+		this.toolbarChapterEl = toolbarTitle.createEl("span", { cls: "clp-toolbar-chapter" });
+		this.toolbarBookEl = toolbarTitle.createEl("span", { cls: "clp-toolbar-book" });
+
+		const tocToggle = root.createEl("button", { cls: "clp-toc-toggle" });
+		setIcon(tocToggle, "table-of-contents");
+		tocToggle.ariaLabel = "Table of Contents";
+		this.registerDomEvent(tocToggle, "click", () => this.toggleToc());
+
+		// Paired with the Highlights toggle in the right corner: a bookmark is
+		// an annotation, so it belongs beside the annotation surface rather
+		// than beside Book search. `updateBookmarkButton` owns its active state.
+		const bookmarkToggle = root.createEl("button", { cls: "clp-bookmark-toggle" });
+		setIcon(bookmarkToggle, BOOKMARK_MODE.icon);
+		bookmarkToggle.ariaLabel = "Bookmark this page";
+		this.registerDomEvent(bookmarkToggle, "click", () => void this.toggleBookmark());
+		this.bookmarkToggleEl = bookmarkToggle;
+
+		// Page-turn affordances: floating chevrons at the far edges, revealed on
+		// reader hover (same idiom as the panel toggles). advance()/retreat()
+		// no-op at the boundaries, so no disabled state is needed.
+		const prevPage = root.createEl("button", { cls: "clp-page-nav clp-page-nav-prev" });
+		setIcon(prevPage, "chevron-left");
+		prevPage.ariaLabel = "Previous page";
+		this.registerDomEvent(prevPage, "click", () => void this.retreat());
+
+		const nextPage = root.createEl("button", { cls: "clp-page-nav clp-page-nav-next" });
+		setIcon(nextPage, "chevron-right");
+		nextPage.ariaLabel = "Next page";
+		this.registerDomEvent(nextPage, "click", () => void this.advance());
+
+		const tocPanel = root.createEl("div", { cls: "clp-toc" });
+		// Closed slide-in panels are translated off-canvas but stay rendered
+		// and focusable; inert keeps Tab out of them. Without it, focusing a
+		// hidden control makes the browser scroll .view-content sideways to
+		// reveal it, shoving the whole reader (overflow:hidden doesn't stop
+		// focus-scroll). Synced in toggleToc / toggleHighlightsPanel.
+		tocPanel.inert = true;
+		const tocHeader = tocPanel.createEl("div", { cls: "clp-toc-header" });
+		this.tocTitleEl = tocHeader.createEl("span", { cls: "clp-toc-title", text: "Contents" });
+		const tocClose = tocHeader.createEl("button", { cls: "clp-pane-hdr-btn clp-toc-close" });
+		setIcon(tocClose, "x");
+		this.registerDomEvent(tocClose, "click", () => this.toggleToc());
+		this.tocListEl = tocPanel.createEl("div", { cls: "clp-toc-list" });
+
+		const tocFooter = tocPanel.createEl("div", { cls: "clp-toc-footer" });
+		// Leftmost by design: the theme button hides itself outside 3C mode, so
+		// anything to its right would shift position whenever 3C is toggled.
+		const helpBtn = tocFooter.createEl("button", { cls: "clp-toc-help-btn" });
+		setIcon(helpBtn, "circle-help");
+		helpBtn.ariaLabel = "How to use the reader";
+		this.registerDomEvent(helpBtn, "click", () => new HelpModal(this.app, this.plugin.settings).open());
+		const translationBtn = tocFooter.createEl("button", { cls: "clp-toc-translation-btn" });
+		setIcon(translationBtn, "languages");
+		this.registerDomEvent(translationBtn, "click", async () => {
+			const current = this.plugin.settings.translation.viewMode;
+			this.plugin.settings.translation.viewMode = current === "source" ? "bilingual" : current === "bilingual" ? "target" : "source";
+			await this.plugin.saveSettings();
+		});
+		const layoutBtn = tocFooter.createEl("button", { cls: "clp-toc-layout-btn" });
+		this.registerDomEvent(layoutBtn, "click", async () => {
+			const current = this.plugin.settings.translation.bilingualLayout;
+			this.plugin.settings.translation.bilingualLayout = current === "horizontal" ? "vertical" : "horizontal";
+			await this.plugin.saveSettings();
+		});
+		const exportBtn = tocFooter.createEl("button", { cls: "clp-toc-export-btn" });
+		setIcon(exportBtn, "download");
+		exportBtn.ariaLabel = "Çift dilli Markdown dışa aktar";
+		this.registerDomEvent(exportBtn, "click", () => void this.exportBilingualMarkdown());
+		const modeBtn = tocFooter.createEl("button", { cls: "clp-toc-mode-btn" });
+		// eslint-disable-next-line no-unsanitized/property -- Safe: LOGO_3C_SVG is a compile-time SVG constant.
+		modeBtn.innerHTML = LOGO_3C_SVG;
+		this.registerDomEvent(modeBtn, "click", () => void this.toggleClpMode());
+		const themeBtn = tocFooter.createEl("button", { cls: "clp-toc-theme-btn" });
+		this.registerDomEvent(themeBtn, "click", async () => {
+			this.plugin.settings.clpTheme = this.plugin.settings.clpTheme === "dark" ? "light" : "dark";
+			await this.plugin.saveSettings();
+		});
+		// Initialize the footer controls after the shell has been rebuilt. This
+		// keeps the quick translation/layout icons in sync on the first render.
+		this.updateTocFooter();
+
+		this.makePaneResizable(tocPanel, "right");
+
+		const tocBackdrop = root.createEl("div", { cls: "clp-toc-backdrop" });
+		this.registerDomEvent(tocBackdrop, "click", () => this.toggleToc());
+
+		// Book search — one morphing element (the library-search pattern): a
+		// ghost icon button beside the Highlights toggle that expands leftward
+		// into the field on open (right-anchored, so width growth IS leftward
+		// expansion). Results drop into a separate card beneath it. See the
+		// In-Book Search spec + BookSearchButton components.
+		const searchBar = root.createEl("div", { cls: "clp-search-bar" });
+		searchBar.ariaLabel = "Search in book";
+		const searchIcon = searchBar.createEl("span", { cls: "clp-search-bar-icon" });
+		setIcon(searchIcon, "clp-icon-book-search");
+		this.searchInputEl = searchBar.createEl("input", {
+			cls: "clp-book-search-input",
+			attr: { type: "text", placeholder: "Reveal a passage…", spellcheck: "false" },
+		});
+		// Collapsed to width 0 but still in the DOM — keep it out of the tab
+		// order until the bar opens (same focus-leak family as the blur() on
+		// close). Synced in toggleBookSearch.
+		this.searchInputEl.tabIndex = -1;
+		const searchClear = searchBar.createEl("button", { cls: "clp-book-search-clear" });
+		setIcon(searchClear, "x");
+		searchClear.ariaLabel = "Clear search";
+		this.searchResultsEl = root.createEl("div", { cls: "clp-book-search clp-hidden" });
+		this.searchBarEl = searchBar;
+		this.searchOpen = false;
+		this.searchQuery = "";
+		this.searchHits = [];
+		this.registerDomEvent(searchBar, "click", () => {
+			if (!this.searchOpen) this.toggleBookSearch(true);
+		});
+		this.registerDomEvent(this.searchInputEl, "input", () => {
+			const value = this.searchInputEl?.value ?? "";
+			if (this.searchDebounce !== null) window.clearTimeout(this.searchDebounce);
+			this.searchDebounce = window.setTimeout(() => {
+				this.searchDebounce = null;
+				this.searchQuery = value;
+				void this.renderSearchResults();
+			}, 200);
+		});
+		// Result-list keyboard navigation, combobox-style: focus never leaves
+		// the field; ↑/↓ move a virtual active row, Enter jumps to it (first
+		// result when nothing is focused yet). preventDefault keeps the arrows
+		// from moving the text caret.
+		this.registerDomEvent(this.searchInputEl, "keydown", (e: KeyboardEvent) => {
+			if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+				e.preventDefault();
+				this.moveSearchActive(e.key === "ArrowDown" ? 1 : -1);
+			} else if (e.key === "Enter") {
+				e.preventDefault();
+				const hit = this.searchHits[Math.max(0, this.searchActiveIdx)];
+				if (hit) void this.jumpToSearchHit(hit);
+			}
+		});
+		// The × clears a non-empty query; on an empty one it collapses the bar
+		// (the mock's × is the expanded bar's only affordance).
+		this.registerDomEvent(searchClear, "click", (e: MouseEvent) => {
+			e.stopPropagation();
+			// On touch the × is the only way out of search, and clear-then-close
+			// spends the first tap on something that looks like nothing happened.
+			// One tap closes, always; the query survives to the next open. Desktop
+			// keeps clear-first — Escape already closes the bar there.
+			if (Platform.isMobile || !this.searchInputEl?.value) {
+				this.toggleBookSearch(false);
+				return;
+			}
+			this.searchInputEl.value = "";
+			this.searchQuery = "";
+			void this.renderSearchResults();
+			this.searchInputEl.focus();
+		});
+		// Delegated row clicks — rows re-render per keystroke, so a single
+		// listener on the host instead of one per row.
+		this.registerDomEvent(this.searchResultsEl, "click", (e: MouseEvent) => {
+			const row = (e.target as Element).closest<HTMLElement>(".clp-book-search-row");
+			const idx = row ? parseInt(row.dataset.hitIdx ?? "", 10) : NaN;
+			const hit = Number.isNaN(idx) ? undefined : this.searchHits[idx];
+			if (hit) void this.jumpToSearchHit(hit);
+		});
+
+		// Highlights navigation panel — the pane builds its own toggle, panel and
+		// backdrop into the shell root, in that order.
+		this.pane.mount(root);
+		this.applyAiFeaturesState();
+
+		this.spreadEl = root.createEl("div", { cls: "clp-spread clp-hidden" });
+		this.contentNode = this.spreadEl.createEl("div", { cls: "clp-content" });
+		this.syncSpreadLayoutMode(this.spreadEl);
+		this.registerQuickLookupHover(this.spreadEl);
+		this.registerDomEvent(this.spreadEl, "scroll", () => {
+			if (!this.isContinuousFlow() || this.continuousScrollRaf !== null) return;
+			this.continuousScrollRaf = requestAnimationFrame(() => {
+				this.continuousScrollRaf = null;
+				this.syncContinuousPosition();
+				this.updateProgress();
+				this.updateTocActive();
+				this.schedulePositionSave();
+			});
+		});
+
+		this.cacheHost = root.createEl("div", { cls: "clp-hidden" });
+		this.prevHost = this.cacheHost.createEl("div");
+		this.nextHost = this.cacheHost.createEl("div");
+
+		this.resizeObserver?.disconnect();
+		// Observe the BORDER box, not the default content box. The spread's
+		// horizontal padding grows with pane width (gutters), pinning the content
+		// box at the line-width cap — a default observer is blind to the pane
+		// widening past it, and never fires when a sidebar closes.
+		if (this.spreadEl) this.resizeObserver?.observe(this.spreadEl, { box: "border-box" });
+		// The root as well, and it has to be: `clp-kbd-frozen` pins the spread's
+		// height, so while the keyboard is up the spread reports no size change
+		// at all — observing it alone, nothing would ever see the viewport grow
+		// back and the freeze would never lift. The root keeps resizing either
+		// way. Re-observing the same element on a later book open is a no-op.
+		this.resizeObserver?.observe(this.contentEl, { box: "border-box" });
+
+		// Pointer only — on touch the same floater is raised by the first tap of
+		// the reference two-step (handleReferenceTap), so leaving this registered
+		// would race it with a synthesised hover.
+		if (!Platform.isMobile) {
+			this.registerDomEvent(this.spreadEl, "mouseover", (e: MouseEvent) => {
+				this.showReferenceTooltip(e);
+			});
+			this.registerDomEvent(this.spreadEl, "mouseout", (e: MouseEvent) => {
+				const to = e.relatedTarget as Element | null;
+				const leavingLink = (e.target as Element | null)?.closest("a[href]") as HTMLAnchorElement | null;
+				if (leavingLink && to?.closest("a[href]") === leavingLink) return;
+				const leavingCite = (e.target as Element | null)?.closest(".clp-citation");
+				if (leavingCite && to?.closest(".clp-citation") === leavingCite) return;
+				this.hoveredLinkPreviewKey = null;
+				if (!to?.closest(".clp-tooltip")) this.hideTooltip();
+			});
+		}
+
+		// Annotation preview on hover. Rects are pointer-events: none so text
+		// under a highlight stays selectable, so we hit-test ourselves against
+		// their bounding boxes on every mousemove. Cost is a few dozen rect
+		// compares per frame — negligible versus the cost of losing selection.
+		// Pointer only. Touch synthesises mousemove on tap, which would raise the
+		// preview under the finger and then strand it there — mouseleave never
+		// fires without a pointer to leave with. The tap grammar replaces it:
+		// see handleHighlightClick.
+		if (!Platform.isMobile) {
+			this.registerDomEvent(this.spreadEl, "mousemove", (e: MouseEvent) => {
+				this.handleAnnotationHover(e);
+			});
+			this.registerDomEvent(this.spreadEl, "mouseleave", () => {
+				this.hideAnnotationPreview();
+			});
+		}
+
+		this.registerDomEvent(this.spreadEl, "click", (e: MouseEvent) => {
+			// Saved-highlight rects sit at z-index: 0 with pointer-events: none,
+			// so the click target is the underlying paragraph. Hit-test the
+			// pointer against the rendered rects: if it lands on an AI-bearing
+			// highlight, open the Conversations tab and expand its card.
+			if (this.handleHighlightClick(e)) {
+				e.preventDefault();
+				return;
+			}
+			// Footnotes and citations preview before they navigate on touch.
+			if (Platform.isMobile && this.handleReferenceTap(e)) {
+				e.preventDefault();
+				return;
+			}
+			const anchor = (e.target as Element).closest("a[href]");
+			if (!anchor) return;
+			const href = anchor.getAttribute("href") ?? "";
+			if (href.startsWith("#")) {
+				e.preventDefault();
+				const t = this.findTarget(href.slice(1));
+				if (t) {
+					this.savePosition();
+					this.scrollToTarget(t);
+				}
+			} else if (href.startsWith("http")) {
+				e.preventDefault();
+				window.open(href, "_blank");
+			} else if (this.book) {
+				e.preventDefault();
+				void this.navigateToHref(href);
+			}
+		});
+		// Trackpad two-finger horizontal swipe → page turn, exactly one page per
+		// physical swipe. Accumulate horizontal delta and fire once past a
+		// threshold, then DISARM. Re-arming is magnitude-based: the momentum tail
+		// decays but stays above SWIPE_REARM_FLOOR for its whole duration, so it's
+		// ignored; only once the gesture physically settles (near-zero delta) does
+		// the next swipe become possible. To page repeatedly, swipe in succession.
+		// Vertical-dominant scroll (plain mouse wheel) stays inert.
+		const SWIPE_THRESHOLD = 45;
+		const SWIPE_IDLE_RESET_MS = 150;
+		let swipeAccum = 0;
+		let swipeArmed = true;
+		let swipeIdleTimer: number | null = null;
+		this.registerDomEvent(this.spreadEl, "wheel", (e: WheelEvent) => {
+			if (this.isContinuousFlow()) return;
+			// Keep navigation transform-driven; native wheel scrolling causes horizontal drift.
+			e.preventDefault();
+			if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+			// Full stop resets everything (belt-and-braces with the floor re-arm).
+			if (swipeIdleTimer !== null) window.clearTimeout(swipeIdleTimer);
+			swipeIdleTimer = window.setTimeout(() => {
+				swipeAccum = 0;
+				swipeArmed = true;
+				swipeIdleTimer = null;
+			}, SWIPE_IDLE_RESET_MS);
+			// While disarmed, swallow every event (the momentum tail keeps resetting
+			// the idle timer above) and only re-arm once the wheel stream has fully
+			// stopped for SWIPE_IDLE_RESET_MS. Re-arming on a momentary low-delta dip
+			// instead would catch the lull at the gesture→momentum handoff and let the
+			// inertial tail fire a second page turn — one physical flick, two pages.
+			if (!swipeArmed) return;
+			// Reversed direction: start counting the new direction fresh.
+			if (swipeAccum !== 0 && Math.sign(e.deltaX) !== Math.sign(swipeAccum)) swipeAccum = 0;
+			swipeAccum += e.deltaX;
+			if (Math.abs(swipeAccum) < SWIPE_THRESHOLD) return;
+			swipeArmed = false;
+			const dir = swipeAccum;
+			swipeAccum = 0;
+			if (dir > 0) void this.advance();
+			else void this.retreat();
+		});
+		this.registerDomEvent(this.spreadEl, "mouseup", () => this.raiseGlossForSelection());
+
+		// Touch page-turn zones (Phase C). Two full-height strips at the left and
+		// right edges turn pages; everything between them toggles the chrome.
+		// The strips are the *columns* the chevrons sit in, run from the top of
+		// the screen to the bottom — being level with the button is the most
+		// obvious way to hit one, not the only way.
+		//
+		// Hit-tested from the pointer position rather than given their own
+		// elements. Overlay divs would sit above the text and swallow the drag
+		// that starts a selection, and the whole gloss grammar depends on
+		// selection working everywhere; nothing is added to the DOM, so nothing
+		// can intercept a gesture it shouldn't. Bound on `root` rather than the
+		// spread so the strips genuinely reach the screen edges, and it fires on
+		// `click` (not `pointerup`) so the spread's own handler below has
+		// already claimed link and highlight taps via preventDefault.
+		this.registerDomEvent(root, "pointerdown", (e: PointerEvent) => {
+			this.tapStart = { x: e.clientX, y: e.clientY, t: Date.now() };
+		});
+		this.registerDomEvent(root, "click", (e: MouseEvent) => {
+			const start = this.tapStart;
+			this.tapStart = null;
+			if (!Platform.isMobile || !start || e.defaultPrevented) return;
+			if (Date.now() - start.t > ReaderView.TAP_MAX_MS) return;
+			if (Math.abs(e.clientX - start.x) > ReaderView.TAP_SLOP_PX) return;
+			if (Math.abs(e.clientY - start.y) > ReaderView.TAP_SLOP_PX) return;
+			this.handleReaderTap(e);
+		});
+
+		const footer = root.createEl("div", { cls: "clp-footer" });
+		this.localPageEl = footer.createEl("span", { cls: "clp-page-info" });
+		this.progressBarEl = footer.createEl("div", { cls: "clp-progress-bar" });
+		// Phone track: one chapter-scoped bar where desktop has a segment per
+		// section. Lives inside `.clp-progress-bar` so it shares a coordinate
+		// space with the back pill and its marker, which carry over unchanged.
+		const mobileTrack = this.progressBarEl.createEl("div", { cls: "clp-mobile-progress" });
+		this.mobileFillEl = mobileTrack.createEl("div", { cls: "clp-mobile-progress-fill" });
+		const backMarker = this.progressBarEl.createEl("div", { cls: "clp-progress-back-marker clp-hidden" });
+		// The dot marks the return point on the bar and clicking it returns there.
+		// It lives and dies with the pill (see registerReadingTurn) — there is no
+		// state where one is on screen without the other.
+		this.registerDomEvent(backMarker, "click", (e) => {
+			e.stopPropagation();
+			void this.goBack();
+		});
+		const backBtn = this.progressBarEl.createEl("button", { cls: "clp-progress-back clp-hidden" });
+		const backIcon = backBtn.createEl("span", { cls: "clp-progress-back-icon" });
+		setIcon(backIcon, "redo-2");
+		backBtn.createEl("span", { cls: "clp-progress-back-label", text: "Back" });
+		this.registerDomEvent(backBtn, "click", (e) => {
+			e.stopPropagation();
+			void this.goBack();
+		});
+		this.progressTipEl = this.progressBarEl.createEl("div", { cls: "clp-progress-tooltip clp-hidden" });
+		this.registerDomEvent(this.progressBarEl, "mousedown", (e) => this.onProgressMouseDown(e));
+		this.registerDomEvent(this.progressBarEl, "mousemove", (e) => this.onProgressMouseMove(e));
+		this.registerDomEvent(this.progressBarEl, "mouseleave", () => {
+			this.progressTipEl?.addClass("clp-hidden");
+		});
+		this.globalPageEl = footer.createEl("span", { cls: "clp-global-page" });
+		// Hangs off the root, not the footer: the footer *is* the bar on a phone
+		// and moves and resizes with it, while this line has to hold still
+		// relative to the screen (above the bar, then below the navbar).
+		this.mobilePagesEl = root.createEl("span", { cls: "clp-mobile-pages" });
+
+		this.applyThemeClasses();
+	}
+
+	/** Drag-to-resize for this view's slide-in panes (TOC and Highlights).
+	 *  The reader's `contentEl` is the bound the pane must stay inside. */
+	private makePaneResizable(panel: HTMLElement, edge: "left" | "right"): void {
+		makePaneResizable(this, panel, edge, this.contentEl);
+	}
+
+	toggleToc(): void {
+		this.tocOpen = !this.tocOpen;
+		const toc = this.contentEl.querySelector<HTMLElement>(".clp-toc");
+		const backdrop = this.contentEl.querySelector(".clp-toc-backdrop");
+		const toggle = this.contentEl.querySelector(".clp-toc-toggle");
+		if (toc) toc.inert = !this.tocOpen;
+		if (this.tocOpen) {
+			toc?.addClass("clp-toc-open");
+			backdrop?.addClass("clp-toc-backdrop-visible");
+			toggle?.addClass("clp-chrome-btn-hidden");
+			// The search bar shares this corner and outranks the panel on
+			// z-index (25 vs 20), so it would float on top of it rather than be
+			// covered. No need to *close* an open search here as well: every
+			// route into this method either fires a document mousedown first
+			// (the three click handlers) or can't run while the search input has
+			// focus (`t` is gated on `!typing`, and Escape closes the search
+			// before it reaches the ToC).
+			this.searchBarEl?.addClass("clp-search-bar-hidden");
+			requestAnimationFrame(() => {
+				const active = this.contentEl.querySelector(".clp-toc-item.clp-toc-active");
+				active?.scrollIntoView({ block: "center", behavior: "smooth" });
+			});
+		} else {
+			toc?.removeClass("clp-toc-open");
+			backdrop?.removeClass("clp-toc-backdrop-visible");
+			toggle?.removeClass("clp-chrome-btn-hidden");
+			this.searchBarEl?.removeClass("clp-search-bar-hidden");
+		}
+		this.syncPaneOpen();
+	}
+
+	/** One class for "a slide-in pane owns the screen", driven by both panes.
+	 *  Phone-only in effect: a full-width pane covers the toolbar, but every
+	 *  control underneath keeps its 44px hit area *above* the pane, so the
+	 *  buttons stay tappable while invisible, so closing the ToC also opens the
+	 *  Highlights pane. Retiring the whole bar for the
+	 *  duration (Mobile/ToC, Mobile/Annotations) is one rule instead of a
+	 *  fourth per-button hidden-state family. */
+	private syncPaneOpen(): void {
+		this.contentEl.toggleClass("clp-pane-open", this.tocOpen || this.pane.isOpen);
+		this.syncChromeHold();
+	}
+
+	/** An open pane or search bar holds the chrome up for as long as it owns the
+	 *  screen, and hands it a fresh dwell on the way out.
+	 *
+	 *  Without the hold the timer keeps running underneath, so dismissing a
+	 *  long-open search finds the chrome already expired — taking the bar's own
+	 *  close animation with it. Re-revealing on close, rather than only
+	 *  re-arming, covers a chrome that expired before the pane was opened.
+	 *
+	 *  Deliberately does not *add* the visible class while held: on a phone that
+	 *  class also drives Obsidian's navbar (`syncMobileChrome`), so forcing it on
+	 *  behind a full-screen pane would pull the navbar back into view. Holding
+	 *  means "stop the clock", not "turn it on" — and for a pane, which owns the
+	 *  whole screen, `syncMobileChrome` takes the navbar and status bar down. */
+	private syncChromeHold(): void {
+		if (!Platform.isMobile) return;
+		if (this.tocOpen || this.pane.isOpen || this.searchOpen) {
+			if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
+			this.chromeHideTimer = null;
+			this.syncMobileChrome();
+		} else {
+			this.revealChrome();
+		}
+	}
+
+	/** Re-run the chrome sync on focus changes, but only while a pane owns the
+	 *  screen: that is the one state where the keyboard guard flips the navbar
+	 *  back over a chat box, and it has to flip back when the field blurs. */
+	private syncPaneChrome(): void {
+		if (this.tocOpen || this.pane.isOpen) this.syncMobileChrome();
+	}
+
+	private renderToc(): void {
+		if (!this.book || !this.tocListEl) return;
+		this.tocListEl.empty();
+		if (this.tocTitleEl) this.tocTitleEl.setText(this.book.title);
+		this.toolbarBookEl?.setText(this.book.title);
+		const items = this.sections.length > 1
+			? this.sections.map((section) => ({ label: section.label, href: section.tocHref, children: [] }))
+			: this.book.toc;
+		this.renderTocItems(items, this.tocListEl, 0);
+		this.updateTocActive();
+	}
+
+	private renderTocItems(items: EpubTocItem[], container: HTMLElement, level: number): void {
+		for (const [ordinal, item] of items.entries()) {
+			const spineIndex = this.book
+				? this.book.spine.findIndex((spine) => spine.href === item.href.split("#", 1)[0])
+				: -1;
+			const displayLabel = this.book && spineIndex >= 0
+				? sectionDisplayLabel(this.book, item.label, spineIndex, ordinal)
+				: item.label.trim() || `Chapter ${ordinal + 1}`;
+			const el = container.createEl("div", { cls: "clp-toc-item", text: displayLabel });
+			el.dataset.href = item.href;
+			el.dataset.level = String(level);
+			el.style.paddingLeft = `${1 + level * 1.25}rem`;
+			this.registerDomEvent(el, "click", () => {
+				void this.navigateToTocHref(item.href);
+				this.toggleToc();
+			});
+			if (item.children.length > 0) this.renderTocItems(item.children, container, level + 1);
+		}
+	}
+
+	// ─── Book search (Phase 5 — see In-Book Search feature spec) ─────────────
+
+	toggleBookSearch(force?: boolean): void {
+		const open = force ?? !this.searchOpen;
+		if (open === this.searchOpen) return;
+		this.searchOpen = open;
+		this.searchBarEl?.toggleClass("clp-search-bar-open", open);
+		// Root-level twin of the bar's own class: on a phone the open search is
+		// the only chrome on screen (Mobile/BookSearch), so the toolbar and the
+		// other three controls stand down for the duration. The bar's class is
+		// on the bar itself and can't reach its siblings.
+		this.contentEl.toggleClass("clp-search-open", open);
+		this.searchResultsEl?.toggleClass("clp-hidden", !open);
+		if (this.searchInputEl) this.searchInputEl.tabIndex = open ? 0 : -1;
+		this.syncScrim();
+		if (open) {
+			// One transient layer at a time: opening search over a live gloss
+			// bar/input dismisses it (mirrors the Escape ordering).
+			if (this.isGlossActive()) this.dismissGloss();
+			// Kick the lazy index and repaint (instant on later opens — the
+			// promise is cached per book; last query persists for the session).
+			void this.renderSearchResults();
+			this.searchInputEl?.focus();
+		} else {
+			// A collapsed bar must not keep keyboard focus: the typing guard
+			// would swallow the reader hotkeys (s to reopen, t/h, arrows) while
+			// every keystroke kept typing into the hidden field.
+			this.searchInputEl?.blur();
+		}
+		this.syncChromeHold();
+	}
+
+	private getSearchIndex(): Promise<BookSearchEntry[]> {
+		this.searchIndexPromise ??= this.buildSearchIndex();
+		return this.searchIndexPromise;
+	}
+
+	/** Build the full-book text index from the raw spine XHTML — the same
+	 *  source renderSpineRange reads, parsed with DOMParser (nothing rendered
+	 *  or mounted). The walk mirrors prepareUnit (same block selector, same
+	 *  isRegisterableBlock filter, paraCount reset per spine item) so the
+	 *  predicted paraIds line up with the mounted DOM. */
+	private async buildSearchIndex(): Promise<BookSearchEntry[]> {
+		const book = this.book;
+		if (!book) return [];
+		const index: BookSearchEntry[] = [];
+		const parser = new DOMParser();
+		for (let sectionIdx = 0; sectionIdx < this.sections.length; sectionIdx++) {
+			const section = this.sections[sectionIdx];
+			for (let spine = section.startSpine; spine <= section.endSpine; spine++) {
+				const item = book.spine[spine];
+				if (!item) continue;
+				let raw: string;
+				try {
+					const filePath = book.opfDir + item.href;
+					raw = await book.zip.file(filePath)!.async("string");
+				} catch { continue; }
+				// Same self-closing-tag repair renderSpineRange applies, for the same
+				// reason the strip below exists: this walk has to see the DOM the
+				// mounted one sees, or the predicted paraIds drift from it.
+				const body = parser
+					.parseFromString(expandSelfClosingTags(raw), "text/html")
+					.querySelector("body");
+				if (!body) continue;
+				// Mirror renderSpineRange's strip — style/script text must not
+				// leak into textContent or offsets drift from the rendered DOM.
+				body.querySelectorAll("style, script").forEach((el) => el.remove());
+				let paraCount = 0;
+				for (const el of Array.from(body.querySelectorAll<HTMLElement>(REGISTERABLE_BLOCK_SELECTOR))) {
+					if (!isRegisterableBlock(el)) continue;
+					const text = el.textContent ?? "";
+					index.push({
+						paraId: `s${spine}-p${paraCount}`,
+						sectionIdx,
+						text,
+						textLower: text.toLocaleLowerCase(),
+					});
+					paraCount++;
+				}
+			}
+		}
+		return index;
+	}
+
+	private runBookSearch(index: BookSearchEntry[], query: string): BookSearchHit[] {
+		const q = query.trim().toLocaleLowerCase();
+		if (q.length < SEARCH_MIN_CHARS) return [];
+		const hits: BookSearchHit[] = [];
+		for (const entry of index) {
+			let from = 0;
+			let at: number;
+			while ((at = entry.textLower.indexOf(q, from)) !== -1) {
+				hits.push({ entry, start: at, end: at + q.length });
+				from = at + q.length;
+				if (hits.length >= SEARCH_MAX_HITS) return hits;
+			}
+		}
+		return hits;
+	}
+
+	private async renderSearchResults(): Promise<void> {
+		const host = this.searchResultsEl;
+		if (!host) return;
+		const query = this.searchQuery;
+		const index = await this.getSearchIndex();
+		// Stale-render guard: query changed or shell rebuilt while indexing.
+		if (this.searchResultsEl !== host || this.searchQuery !== query) return;
+		host.empty();
+		this.searchHits = [];
+		this.searchActiveIdx = -1;
+		if (query.trim().length < SEARCH_MIN_CHARS) return;
+		const hits = this.runBookSearch(index, query);
+		this.searchHits = hits;
+		if (hits.length === 0) {
+			host.createEl("div", { cls: "clp-book-search-empty", text: "No matches" });
+			return;
+		}
+		const hlRanges = this.savedHighlights.length > 0
+			? this.buildSearchHighlightRanges(index)
+			: null;
+		hits.slice(0, SEARCH_RENDER_CAP).forEach((hit, i) => {
+			const row = host.createEl("div", { cls: "clp-book-search-row" });
+			row.dataset.hitIdx = String(i);
+			// Hits inside a saved highlight re-add the annotation card's accent
+			// bar + mode icon slots; plain hits stay bare.
+			const overlap = hlRanges?.get(hit.entry.paraId)
+				?.find((r) => hit.start < r.end && hit.end > r.start);
+			if (overlap) {
+				row.dataset.glossMode = overlap.mode;
+				const iconEl = row.createEl("span", { cls: "clp-book-search-row-icon" });
+				const modeMeta = GLOSS_MODES.find((m) => m.id === overlap.mode);
+				if (modeMeta) setIcon(iconEl, modeMeta.icon);
+			}
+			const rowBody = row.createEl("div", { cls: "clp-book-search-row-body" });
+			rowBody.createEl("div", {
+				cls: "clp-book-search-row-section",
+				text: this.sections[hit.entry.sectionIdx]?.label ?? "—",
+			});
+			const snippet = rowBody.createEl("div", { cls: "clp-book-search-row-snippet" });
+			const parts = this.searchSnippet(hit);
+			snippet.appendText(parts.before);
+			snippet.createEl("strong", { text: parts.match });
+			snippet.appendText(parts.after);
+		});
+		if (hits.length > SEARCH_RENDER_CAP) {
+			const capped = hits.length >= SEARCH_MAX_HITS;
+			host.createEl("div", {
+				cls: "clp-book-search-more",
+				text: `${hits.length - SEARCH_RENDER_CAP}${capped ? "+" : ""} more — refine your search`,
+			});
+		}
+	}
+
+	/** Move the keyboard-focused result row by `delta`, clamped to the rendered
+	 *  rows (searchHits can exceed SEARCH_RENDER_CAP; navigation stays within
+	 *  what's on screen). Row order matches searchHits order, so the index is
+	 *  valid for both styling and the Enter-to-jump lookup. */
+	private moveSearchActive(delta: number): void {
+		const rows = this.searchResultsEl?.querySelectorAll<HTMLElement>(".clp-book-search-row");
+		if (!rows || rows.length === 0) return;
+		const next = Math.max(0, Math.min(rows.length - 1, this.searchActiveIdx + delta));
+		if (next === this.searchActiveIdx) return;
+		this.searchActiveIdx = next;
+		rows.forEach((row, i) => row.toggleClass("clp-book-search-row-active", i === next));
+		rows[next].scrollIntoView({ block: "nearest" });
+	}
+
+	/** ±~50 chars of context around the match, snapped to word boundaries. */
+	private searchSnippet(hit: BookSearchHit): { before: string; match: string; after: string } {
+		const text = hit.entry.text;
+		let s = Math.max(0, hit.start - 50);
+		let e = Math.min(text.length, hit.end + 50);
+		if (s > 0) {
+			const sp = text.indexOf(" ", s);
+			if (sp !== -1 && sp < hit.start) s = sp + 1;
+		}
+		if (e < text.length) {
+			const sp = text.lastIndexOf(" ", e);
+			if (sp > hit.end) e = sp;
+		}
+		return {
+			before: (s > 0 ? "…" : "") + text.slice(s, hit.start),
+			match: text.slice(hit.start, hit.end),
+			after: text.slice(hit.end, e) + (e < text.length ? "…" : ""),
+		};
+	}
+
+	/** Char-range highlight coverage per index paragraph, resolved against the
+	 *  live savedHighlights[] at render time (they can change mid-session).
+	 *  Start paragraphs resolve the way the overlay painter does: paraId hint
+	 *  verified against the stored prefix, full scan as fallback; end paragraphs
+	 *  are taken from the hint verbatim (same as renderSavedHighlights).
+	 *  Cross-paragraph highlights fully cover the paragraphs between their
+	 *  boundaries. */
+	private buildSearchHighlightRanges(
+		index: BookSearchEntry[],
+	): Map<string, { mode: string; start: number; end: number }[]> {
+		const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+		const byId = new Map(index.map((e) => [e.paraId, e] as const));
+		const ranges = new Map<string, { mode: string; start: number; end: number }[]>();
+		const add = (paraId: string, mode: string, start: number, end: number) => {
+			let list = ranges.get(paraId);
+			if (!list) ranges.set(paraId, (list = []));
+			list.push({ mode, start, end });
+		};
+		for (const saved of this.savedHighlights) {
+			// A bookmark covers no characters, so it must never mark a search
+			// hit as "highlighted" — its -1 offsets would otherwise register as
+			// a range starting before the paragraph.
+			if (saved.mode === BOOKMARK_MODE.id) continue;
+			let startEntry = byId.get(saved.paraIdHint) ?? null;
+			const needle = norm(saved.prefix);
+			if (needle && (!startEntry || !norm(startEntry.text).startsWith(needle))) {
+				startEntry = index.find((e) => norm(e.text).startsWith(needle)) ?? startEntry;
+			}
+			if (!startEntry) continue;
+			const endId = saved.endParaIdHint;
+			if (!endId || endId === startEntry.paraId) {
+				add(startEntry.paraId, saved.mode, saved.startChar, saved.endChar);
+				continue;
+			}
+			add(startEntry.paraId, saved.mode, saved.startChar, startEntry.text.length);
+			add(endId, saved.mode, 0, saved.endChar);
+			const s = /^s(\d+)-p(\d+)$/.exec(startEntry.paraId);
+			const e = /^s(\d+)-p(\d+)$/.exec(endId);
+			if (s && e && s[1] === e[1]) {
+				for (let p = parseInt(s[2], 10) + 1; p < parseInt(e[2], 10); p++) {
+					const mid = byId.get(`s${s[1]}-p${p}`);
+					if (mid) add(mid.paraId, saved.mode, 0, mid.text.length);
+				}
+			}
+		}
+		return ranges;
+	}
+
+	/** Mirror of jumpToHighlight for a search hit — mount the section's unit,
+	 *  resolve the paragraph (prefix match with the predicted paraId as hint),
+	 *  scroll it into the visible spread. The popover stays open by design. */
+	private async jumpToSearchHit(hit: BookSearchHit): Promise<void> {
+		const match = /^s(\d+)-p(\d+)$/.exec(hit.entry.paraId);
+		if (!match) return;
+		const spineIdx = parseInt(match[1], 10);
+		const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? -1;
+		const section = this.sections[sectionIdx];
+		if (!section) return;
+		this.savePosition();
+		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const spreadOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
+		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
+		const prefix = hit.entry.text.slice(0, 48);
+		const resolvedId = this.offsetMap.findParaIdByPrefix(prefix, hit.entry.paraId) ?? hit.entry.paraId;
+		const entry = this.offsetMap.get(resolvedId);
+		// The match's own first line box, not the paragraph's: a paragraph split
+		// across the column boundary reports the union of its fragments, whose
+		// `left` is always the page it *starts* on — so a hit in the tail landed
+		// a page before the word it had just found.
+		const rects = this.rectsForCharRange(resolvedId, hit.start, hit.end);
+		if (this.isContinuousFlow() && entry?.element) this.scrollToTarget(entry.element);
+		else if (rects.length) this.scrollToX(rects[0].left);
+		else if (entry?.element) this.scrollToTarget(entry.element);
+		// Flash on the next frame so the rects measure against settled layout
+		// (same reason renderSavedHighlights paints in rAF after a mount).
+		requestAnimationFrame(() => this.flashSearchMatch(resolvedId, hit));
+		// Keep the walk-every-mention flow: focus returns to the field so the
+		// next keystroke refines the query instead of firing a reader hotkey.
+		this.searchInputEl?.focus();
+	}
+
+	/** Temporary overlay over the jumped-to match (spec: match flash) — without
+	 *  it, landing on a dense spread means visually grepping the page. Rides
+	 *  the selection-overlay pipeline: char offsets → CursorRange → client
+	 *  rects inside .clp-content. CSS fades the rects; the overlay node is
+	 *  removed after the animation (or, under reduced motion, the same timeout
+	 *  ends a static flash). */
+	private flashSearchMatch(paraId: string, hit: BookSearchHit): void {
+		if (!this.contentNode) return;
+		this.contentNode.querySelectorAll(".clp-search-flash-overlay").forEach((n) => n.remove());
+		const overlay = document.createElement("div");
+		overlay.className = "clp-search-flash-overlay";
+		const contentRect = this.contentNode.getBoundingClientRect();
+		for (const r of this.rectsForCharRange(paraId, hit.start, hit.end)) {
+			const rectEl = document.createElement("div");
+			rectEl.className = "clp-search-flash-rect";
+			rectEl.style.left = `${r.left - contentRect.left}px`;
+			rectEl.style.top = `${r.top - contentRect.top}px`;
+			rectEl.style.width = `${r.width}px`;
+			rectEl.style.height = `${r.height}px`;
+			overlay.appendChild(rectEl);
+		}
+		if (overlay.childElementCount === 0) return;
+		this.contentNode.appendChild(overlay);
+		window.setTimeout(() => overlay.remove(), 4600);
+	}
+
+	/** Reflect the AI-features master switch across this view: the GlossBar
+	 *  collapses to the lone Emphasise tile (Lite) and the Highlights pane hides
+	 *  its Annotations/Conversations tab bar, showing only the Annotations list.
+	 *  Public so `saveSettings` can fan it out to open views on a toggle. */
+	applyAiFeaturesState(): void {
+		this.glossSurface.syncModeState();
+		this.pane.applyAiFeaturesState();
+	}
+
+	/** Toggle the right-rail pane. Public so the plugin's command can reach it
+	 *  without knowing the pane exists. */
+	toggleHighlightsPane(): void {
+		this.pane.toggle();
+	}
+
+	/** Open this book's companion annotation doc. Delegates to the pane, which
+	 *  owns the header button that does the same thing; exposed here for the
+	 *  "Open annotation notes" command. */
+	openCompanionDoc(): Promise<void> {
+		return this.pane.openCompanionDoc();
+	}
+
+	/** Persist the active pane tab into the per-book position record so
+	 *  re-opening the book lands on the same tab. Mirrors
+	 *  `schedulePositionSave`'s write but is fire-and-forget (debounce-less)
+	 *  because tab toggles are user-paced, not stream-of-events. */
+	private persistPaneTab(tab: PaneTab): void {
+		const path = this.currentFile?.path;
+		if (!path) return;
+		const existing = this.plugin.settings.bookPositions[path] ?? {
+			unitIndex: this.currentUnitIndex,
+			spread: this.currentSpread,
+		};
+		this.plugin.settings.bookPositions[path] = { ...existing, pane: tab };
+		void this.plugin.persistSettings();
+	}
+
+	/** Mode-specific system prompt for this book. The template logic is shared
+	 *  with the PDF host; only the title differs. */
+	private buildAiSystemPrompt(saved: SavedHighlight): string {
+		const book = this.book?.title ?? this.currentFile?.basename ?? "the current book";
+		return buildGlossSystemPrompt(this.plugin.settings, book, saved);
+	}
+
+	/** Mount the unit hosting the highlight, then scroll the paragraph into
+	 *  the visible spread. Resolves paraId via prefix so drift-recovered
+	 *  highlights still land correctly. */
+	private async jumpToHighlight(idx: number, closeHighlightsPanel = true): Promise<void> {
+		const saved = this.savedHighlights[idx];
+		if (!saved) return;
+		const match = /^s(\d+)-p(\d+)$/.exec(saved.paraIdHint);
+		if (!match) return;
+		const spineIdx = parseInt(match[1], 10);
+		const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? -1;
+		const section = this.sections[sectionIdx];
+		if (!section) return;
+		this.savePosition();
+		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const spreadOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
+		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
+
+		// After mount, resolve the paragraph by prefix (fall back to hint) and
+		// scroll the highlight into the visible spread.
+		const resolvedId = saved.prefix
+			? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
+			: saved.paraIdHint;
+		if (resolvedId) {
+			// The highlight's own first line box, not the paragraph's box: a
+			// paragraph that splits across the column boundary reports the union
+			// of its fragments, which always points at the page it *starts* on.
+			// A highlight in the tail therefore landed a page early.
+			const rects = this.savedHighlightRects(saved, resolvedId);
+			const entry = this.offsetMap.get(resolvedId);
+			if (this.isContinuousFlow() && entry?.element) this.scrollToTarget(entry.element);
+			else if (rects.length) this.scrollToX(rects[0].left);
+			else if (entry?.element) this.scrollToTarget(entry.element);
+		}
+		if (closeHighlightsPanel && this.pane.isOpen) this.pane.toggle();
+	}
+
+	private async loadFile(file: TFile, initialPos?: { unitIndex: number; spread: number; pct?: number }): Promise<void> {
+		this.resetViewState();
+		this.renderShell();
+		if (file.extension === "epub") {
+			await this.loadEpub(async () => {
+				const data = await this.app.vault.readBinary(file);
+				return parseEpub(data);
+			}, initialPos);
+		} else {
+			this.showError(`Unsupported file type: .${file.extension}`);
+		}
+	}
+
+	private resetViewState(): void {
+		this.sections = [];
+		this.units = [];
+		this.sectionIndexById.clear();
+		this.sectionIndexBySpine = [];
+		this.unitIndexBySection.clear();
+		this.sectionSpreadCounts = [];
+		this.sectionColumnCounts = [];
+		this.sectionStartSpreads = [];
+		this.unitStartSpreads = [];
+		this.spreadMeasureCache.clear();
+		this.unitDomCache.clear();
+		this.lastPositionByBucket.clear();
+		this.currentSpread = 0;
+		this.currentUnitIndex = 0;
+		this.totalSpreads = 1;
+		this.hasMountedUnit = false;
+		this.posAnchor = null;
+		this.previousPosition = null;
+		this.measurementBucketKey = "";
+		this.mountedUnitKeys.prev = "";
+		this.mountedUnitKeys.next = "";
+		this.offsetMap.clear();
+		this.savedHighlights = [];
+		// Drops collapsed-chapter state, the open-note editor, the tab, and any
+		// open chat screen (whose dataset idx points into the old book's list).
+		this.pane.reset();
+		this.layoutMode = "spread";
+		this.linkPreviewCache.clear();
+		this.linkPreviewPending.clear();
+		this.hoveredLinkPreviewKey = null;
+		// Book search: index and query are per-book; the popover DOM itself is
+		// rebuilt by renderShell right after this.
+		this.searchIndexPromise = null;
+		this.searchQuery = "";
+		this.searchHits = [];
+	}
+
+	private async loadEpub(parse: () => Promise<EpubBook>, initialPos?: { unitIndex: number; spread: number; pct?: number }): Promise<void> {
+		try {
+			if (this.book) revokeImageUrls(this.book);
+			this.book = await parse();
+			// Remove loading element before measuring so the spread gets full
+			// flex height — otherwise .clp-loading (also flex:1) steals half
+			// the vertical space, inflating measured spread counts.
+			this.contentEl.querySelector(".clp-loading")?.remove();
+			// Ensure body font is loaded before any canvas-based text measurement.
+			await document.fonts.ready;
+			// Important: keep spread in layout while measuring section pagination.
+			this.spreadEl?.removeClass("clp-hidden");
+			// Let layout settle so spread width/height are valid for measurement.
+			// Single rAF is not enough when the reader pane is still animating
+			// (e.g. hover-peek sidebar plugins that open/close on hover mid-open).
+			// Measuring mid-animation yields bad section spread counts that get
+			// cached against the final width bucket and survive recovery.
+			// The initial build runs through the same serial chain as resize
+			// rebuilds, so a sidebar toggle during load queues behind it instead
+			// of interleaving with it.
+			await this.runLayoutPass(async () => {
+				await this.waitForStableGeometry();
+				// The pass can resume long after it started (rAF suspends while
+				// the window is occluded) — the view may have been torn down in
+				// the meantime. Building against a dead DOM yields NaN geometry.
+				if (!this.spreadEl?.isConnected) return;
+				this.layoutMode = this.resolveLayoutMode();
+				this.syncSpreadLayoutMode(this.spreadEl);
+				// Capture the bucket from the same geometry the measurements are
+				// about to use. If geometry shifts mid-build, the queued resize
+				// pass sees a different live bucket and rebuilds cleanly.
+				this.measurementBucketKey = this.getLayoutBucketKey();
+				this.buildSectionIndex();
+				if (this.isContinuousFlow()) this.buildContinuousUnits();
+				else await this.buildRenderUnits();
+				await this.loadSavedHighlights();
+				this.pane.restoreTab();
+				if (!this.spreadEl?.isConnected) return; // torn down mid-build
+				const startUnit = Math.min(initialPos?.unitIndex ?? 0, Math.max(0, this.units.length - 1));
+				const startSpread = initialPos?.spread ?? 0;
+				if (this.isContinuousFlow()) {
+					const fallbackPct = this.units.length > 1 ? startUnit / (this.units.length - 1) : 0;
+					await this.mountContinuous(initialPos?.pct ?? fallbackPct);
+				} else {
+					await this.mountCurrentUnit(startUnit, startSpread);
+				}
+			});
+			this.renderToc();
+			this.buildProgressSegments();
+			this.updateProgress();
+			this.showSpread();
+			// Not awaited: answering a queued exchange is a network round-trip,
+			// and the book is already readable. It repaints itself when it lands.
+			void this.processQueuedExchanges();
+			// First book open ever: surface the cheat sheet once, then remember.
+			if (!this.plugin.settings.helpShown) {
+				this.plugin.settings.helpShown = true;
+				void this.plugin.saveSettings();
+				new HelpModal(this.app, this.plugin.settings).open();
+			}
+		} catch (err) {
+			// DRM is a known limitation, not a failure — state it plainly and skip
+			// the console noise, since there's nothing here to debug.
+			if (err instanceof EpubDrmError) {
+				this.showError(err.message);
+				return;
+			}
+			console.error("[ComprehensibleLearningPortal] epub parse error", err);
+			this.showError(`Failed to open epub: ${(err as Error).message}`);
+		}
+	}
+
+	// ─── REGION: Section & Unit Modeling ─────────────────────────────────────
+	private buildSectionIndex(): void {
+		if (!this.book) return;
+		// Walk ALL TOC items (parents and leaves) so that part dividers and
+		// other parent-only entries with their own spine item become sections
+		// instead of being silently absorbed into the preceding section.
+			const tocItems: { label: string; href: string }[] = [];
+		const walkAll = (items: EpubTocItem[]): void => {
+			for (const item of items) {
+				tocItems.push({ label: item.label.trim() || "Untitled", href: item.href });
+				if (item.children.length > 0) walkAll(item.children);
+			}
+		};
+		walkAll(this.book.toc);
+
+		const rawSections: { label: string; href: string; startSpine: number }[] = [];
+		const seenSpines = new Set<number>();
+		for (const entry of tocItems) {
+			const path = entry.href.split("#", 1)[0];
+			const idx = this.book.spine.findIndex((s) => s.href === path);
+			if (idx >= 0 && !seenSpines.has(idx)) {
+				seenSpines.add(idx);
+				rawSections.push({ label: sectionDisplayLabel(this.book, entry.label, idx, rawSections.length), href: entry.href, startSpine: idx });
+			}
+		}
+
+		if (rawSections.length === 0) {
+			for (let i = 0; i < this.book.spine.length; i++) {
+				rawSections.push({ label: `Section ${i + 1}`, href: this.book.spine[i].href, startSpine: i });
+			}
+		}
+		// Some Calibre exports contain a one-entry NCX whose only label is the
+		// Russian “Старт” placeholder. Recover the real chapter boundaries from
+		// the chapter headings found in each spine document instead of treating the
+		// whole book as one section.
+		const headingSections = (this.book.spineLabels ?? [])
+			.map((label, index) => ({ label: label?.trim() ?? "", href: this.book!.spine[index]?.href ?? "", startSpine: index }))
+			.filter((entry) => /^(?:chapter|part|unit|section)\b/i.test(entry.label));
+		if (headingSections.length > 1 && (rawSections.length <= 1 || rawSections.every((section) => /[\u0400-\u04ff]/u.test(section.label)))) {
+			rawSections.splice(0, rawSections.length, ...headingSections);
+		}
+
+		rawSections.sort((a, b) => a.startSpine - b.startSpine);
+		this.sections = rawSections.map((s, i) => {
+			const nextStart = rawSections[i + 1]?.startSpine ?? this.book!.spine.length;
+			return {
+				id: `sec-${i}`,
+				label: s.label,
+				tocHref: s.href,
+				startSpine: s.startSpine,
+				endSpine: Math.max(s.startSpine, nextStart - 1),
+			};
+		});
+
+		this.sectionIndexById.clear();
+		this.sectionIndexBySpine = new Array<number>(this.book.spine.length).fill(0);
+		this.sections.forEach((section, idx) => {
+			this.sectionIndexById.set(section.id, idx);
+			for (let s = section.startSpine; s <= section.endSpine; s++) this.sectionIndexBySpine[s] = idx;
+		});
+	}
+
+	// Geometry key encodes everything pagination actually depends on: the
+	// spread's CONTENT-box width/height (clientWidth minus the gutter padding —
+	// past the line-width cap extra pane width becomes padding and layout is
+	// genuinely unchanged, so above-cap resizes short-circuit instead of
+	// triggering a full rebuild), the layout mode, and the column gap (single
+	// mode derives its gap from the padding, which varies at equal content box).
+	private getLayoutBucketKey(): string {
+		if (!this.spreadEl) return "";
+		const cs = getComputedStyle(this.spreadEl);
+		const rawW = this.spreadEl.clientWidth > 0 ? this.spreadEl.clientWidth : this.contentEl.clientWidth;
+		const rawH = this.spreadEl.clientHeight > 0 ? this.spreadEl.clientHeight : this.contentEl.clientHeight;
+		const w = rawW - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+		const h = rawH - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+		const mode = this.resolveLayoutMode();
+		const gap = Math.round(this.getColumnGap(mode));
+		// Text size belongs in the key: it changes how much fits in a column, so
+		// two different sizes at one pane size are genuinely different layouts.
+		// It used to be absent and get away with it — Obsidian's own font-size
+		// setting also drives the document root, and our gutters are rem-based,
+		// so changing it moved the padding and therefore w/h. The reader font
+		// override (settings → Reading) has no such side effect: same pane, same
+		// w/h, bigger text, and every section would have served its stale spread
+		// count from the cache. Measured off the spread rather than read from
+		// settings, so it stays right however the size arrives — app setting,
+		// override, or Obsidian's pinch-to-zoom.
+		const fs = Math.round(this.getSpreadFontSize());
+		return `${Math.max(0, Math.round(w))}x${Math.max(0, Math.round(h))}@${mode}:${gap}:${fs}`;
+	}
+
+	// Wait until the spread element's width and height remain unchanged for
+	// `minStableFrames` consecutive animation frames AND at least `minElapsedMs`
+	// of wall time has passed. The elapsed floor is what catches animations
+	// that start *after* the wait begins (e.g. sidebar auto-collapses once the
+	// new epub tab activates) — without it, stability can "prove" too early
+	// against the pre-animation geometry, then the animation fires, then the
+	// measurement cache holds values that were wrong all along.
+	private async waitForStableGeometry(
+		minStableFrames = 6,
+		maxFrames = 90,
+		minElapsedMs = 400,
+	): Promise<void> {
+		if (!this.spreadEl) return;
+		const start = performance.now();
+		let stableFrames = 0;
+		let lastW = -1;
+		let lastH = -1;
+		for (let i = 0; i < maxFrames; i++) {
+			await new Promise<void>((r) => requestAnimationFrame(() => r()));
+			if (!this.spreadEl) return;
+			const w = this.spreadEl.clientWidth;
+			const h = this.spreadEl.clientHeight;
+			if (w > 0 && h > 0 && w === lastW && h === lastH) {
+				stableFrames++;
+				if (stableFrames >= minStableFrames && performance.now() - start >= minElapsedMs) return;
+			} else {
+				stableFrames = 0;
+				lastW = w;
+				lastH = h;
+			}
+		}
+	}
+
+	private ensureMeasurementNodes(): void {
+		if (!this.contentEl || this.measurementSpreadEl) return;
+		const spread = this.contentEl.createEl("div", { cls: "clp-spread clp-measure-host" });
+		const content = spread.createEl("div", { cls: "clp-content" });
+		this.measurementSpreadEl = spread;
+		this.measurementContentEl = content;
+	}
+
+	private applyPagination(
+		spread: HTMLElement,
+		content: HTMLElement,
+		mode: LayoutMode = this.layoutMode,
+	): { innerWidth: number; colWidth: number; gap: number } {
+		const cs = getComputedStyle(spread);
+		const fallbackWidth = this.spreadEl?.clientWidth ?? this.contentEl.clientWidth;
+		const spreadWidth = spread.clientWidth > 0 ? spread.clientWidth : fallbackWidth;
+		const innerWidth = Math.max(100, spreadWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
+		const gap = this.getColumnGap(mode, spread);
+		// `innerWidth` comes from float padding math and can run a sub-pixel wider
+		// than the pixel-snapped `.clp-content` box the columns actually live in
+		// (this divergence only shows up at fractional UI zoom). Compute the column
+		// width against the real box so two columns are guaranteed to fit.
+		const usableInner = content.clientWidth > 0 ? Math.min(innerWidth, content.clientWidth) : innerWidth;
+		const colWidth = Math.max(100, mode === "single" ? usableInner : (usableInner - gap) / 2);
+		// CSS `column-width` is a *minimum*: if the applied value rounds up even a
+		// hair past what fits, multicol drops from two columns to one full-width
+		// column and the right page is clipped by `overflow: clip`. Apply a value
+		// just under the true column width as the minimum so two columns always
+		// fit; the returned `colWidth` stays the true rendered width so stride and
+		// column-count measurement remain exact.
+		const cssColWidth = mode === "single" ? colWidth : Math.max(100, Math.floor(colWidth) - 1);
+		content.style.columnWidth = `${cssColWidth}px`;
+		content.style.columnGap = `${gap}px`;
+		return { innerWidth, colWidth, gap };
+	}
+
+	private getSpreadCountForContent(content: HTMLElement, pageWidth: number, gap: number): number {
+		const stride = pageWidth + gap;
+		if (stride <= 0) return 1;
+		return Math.max(1, Math.ceil(content.scrollWidth / stride));
+	}
+
+	private getColumnCountForContent(content: HTMLElement, colWidth: number): number {
+		// Ink-extent probe, read from the REAL multicol layout. The old probe
+		// compared the content's natural height (reflowed as one flat 700px
+		// block) against the column height — but fragmentation makes real
+		// column consumption exceed flat height: a `break-inside: avoid-column`
+		// block that would straddle the column boundary is pushed whole into
+		// column 2 even though the flat total fits column 1. Marginal sections
+		// (Myth of Sisyphus ToC) mis-classified as one column, pairing trusted
+		// it, and the pair's partner rendered in a clipped, unreachable third
+		// column. `.clp-content` fills sequentially (`column-fill: auto`), so
+		// ink past the first column's right edge means content truly fragments
+		// there — no height heuristic, no extra reflow.
+		const range = document.createRange();
+		range.selectNodeContents(content);
+		const ink = range.getBoundingClientRect();
+		if (ink.width <= 0) return 1;
+		const left = content.getBoundingClientRect().left;
+		// +1px sub-pixel slack (fractional zoom); the 48px column gap keeps the
+		// two outcomes unambiguous.
+		return ink.right - left <= colWidth + 1 ? 1 : 2;
+	}
+
+	private async measureSection(sectionIdx: number): Promise<{ spreads: number; columns: number; fromCache: boolean }> {
+		if (!this.book) return { spreads: 1, columns: 1, fromCache: false };
+		const section = this.sections[sectionIdx];
+		const bucket = this.getLayoutBucketKey();
+		const key = `${section.id}@${bucket}`;
+		const cached = this.spreadMeasureCache.get(key);
+		if (cached) return { ...cached, fromCache: true };
+
+		this.ensureMeasurementNodes();
+		if (!this.measurementSpreadEl || !this.measurementContentEl) return { spreads: 1, columns: 1, fromCache: false };
+
+		const width = this.spreadEl?.clientWidth || this.contentEl.clientWidth;
+		const height = this.spreadEl?.clientHeight || this.contentEl.clientHeight;
+		this.measurementSpreadEl.style.width = `${Math.max(200, width)}px`;
+		this.measurementSpreadEl.style.height = `${Math.max(200, height)}px`;
+		this.measurementContentEl.empty();
+		await renderSpineRange(this.book, section.startSpine, section.endSpine, this.measurementContentEl);
+		decorateBilingualContent(this.measurementContentEl, this.currentFile ? this.plugin.settings.bilingualBooks[this.currentFile.path] : undefined);
+		this.annotateItalicBlocks(this.measurementContentEl);
+		this.syncSpreadLayoutMode(this.measurementSpreadEl);
+		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
+		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
+		// Column count only gates pairing/singlePage, which test `=== 1`; a
+		// multi-spread section can't be single-column, so skip its ink probe.
+		const columns = spreads > 1 ? 2 : this.getColumnCountForContent(this.measurementContentEl, colWidth);
+		// Cache only if geometry held still across the measurement. The cache
+		// persists across resizes now, so a value measured mid-animation must
+		// not survive keyed against a bucket it doesn't represent.
+		if (this.getLayoutBucketKey() === bucket) {
+			this.spreadMeasureCache.set(key, { spreads, columns });
+		}
+		this.measurementContentEl.empty();
+		return { spreads, columns, fromCache: false };
+	}
+
+	private async buildRenderUnits(isStale?: () => boolean): Promise<void> {
+		if (!this.book) return;
+		this.units = [];
+		this.unitIndexBySection.clear();
+		this.sectionSpreadCounts = new Array<number>(this.sections.length).fill(1);
+		this.sectionColumnCounts = new Array<number>(this.sections.length).fill(1);
+		this.sectionStartSpreads = new Array<number>(this.sections.length).fill(0);
+		this.unitStartSpreads = [];
+		this.totalSpreads = 0;
+
+		for (let i = 0; i < this.sections.length; i++) {
+			// Superseded by a newer queued pass: stop burning frames on a model
+			// that will be rebuilt immediately after. Caller handles the bail.
+			if (isStale?.()) return;
+			const measured = await this.measureSection(i);
+			this.sectionSpreadCounts[i] = measured.spreads;
+			this.sectionColumnCounts[i] = measured.columns;
+			// Yield a frame only when real measurement work happened — a cache-hit
+			// rebuild (returning to a known pane size) runs without pacing.
+			if (!measured.fromCache) await new Promise<void>((r) => requestAnimationFrame(() => r()));
+		}
+
+		for (let i = 0; i < this.sections.length; i++) {
+			const a = this.sections[i];
+			const aCount = this.sectionSpreadCounts[i];
+			const aCols = this.sectionColumnCounts[i] ?? 1;
+			if (this.layoutMode === "spread" && aCount === 1 && aCols === 1 && i + 1 < this.sections.length) {
+				const b = this.sections[i + 1];
+				const bCount = this.sectionSpreadCounts[i + 1];
+				const bCols = this.sectionColumnCounts[i + 1] ?? 1;
+				if (bCount === 1 && bCols === 1) {
+					const unit: RenderUnit = {
+						id: `unit-${this.units.length}`,
+						sectionIds: [a.id, b.id],
+						sectionOffsets: [0, 0],
+						startSpine: a.startSpine,
+						endSpine: b.endSpine,
+						spreadCount: 1,
+					};
+					this.unitIndexBySection.set(a.id, this.units.length);
+					this.unitIndexBySection.set(b.id, this.units.length);
+					this.units.push(unit);
+					i++;
+					continue;
+				}
+			}
+
+			const unit: RenderUnit = {
+				id: `unit-${this.units.length}`,
+				sectionIds: [a.id],
+				sectionOffsets: [0],
+				startSpine: a.startSpine,
+				endSpine: a.endSpine,
+				spreadCount: aCount,
+				// Short section that couldn't pair with a neighbour: flag for
+				// centered single-column rendering instead of half-empty spread.
+				singlePage: aCount === 1 && aCols === 1,
+			};
+			this.unitIndexBySection.set(a.id, this.units.length);
+			this.units.push(unit);
+		}
+		this.rebuildOffsets();
+	}
+
+	private buildContinuousUnits(): void {
+		this.units = [];
+		this.unitIndexBySection.clear();
+		this.sectionSpreadCounts = new Array<number>(this.sections.length).fill(1);
+		this.sectionColumnCounts = new Array<number>(this.sections.length).fill(1);
+		for (let index = 0; index < this.sections.length; index++) {
+			const section = this.sections[index];
+			this.unitIndexBySection.set(section.id, index);
+			this.units.push({
+				id: `continuous-${index}`,
+				sectionIds: [section.id],
+				sectionOffsets: [0],
+				startSpine: section.startSpine,
+				endSpine: section.endSpine,
+				spreadCount: 1,
+			});
+		}
+		this.rebuildOffsets();
+	}
+
+	private async mountContinuous(pct: number): Promise<void> {
+		if (!this.book || !this.contentNode || !this.spreadEl) return;
+		const token = ++this.renderToken;
+		const node = document.createElement("div");
+		node.className = "clp-unit clp-continuous-unit";
+		await renderSpineRange(this.book, 0, this.book.spine.length - 1, node);
+		if (token !== this.renderToken || !this.contentNode) return;
+		decorateBilingualContent(node, this.currentFile ? this.plugin.settings.bilingualBooks[this.currentFile.path] : undefined);
+		this.annotateItalicBlocks(node);
+		this.offsetMap.clear();
+		this.offsetMap.prepareUnit(node);
+		this.contentNode.empty();
+		this.contentNode.addClass("clp-continuous-content");
+		this.contentNode.appendChild(node);
+		this.preloadLinkPreviewsForUnit(node);
+		this.currentSpread = 0;
+		this.currentUnitIndex = readerSectionIndex(pct, this.units.length);
+		this.spineIndex = this.sections[this.currentUnitIndex]?.startSpine ?? 0;
+		this.hasMountedUnit = true;
+		await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+		this.scrollContinuousToFraction(pct, "auto");
+		// Images, fonts and the base ItemView can all cause one more layout pass
+		// after the first paint. Re-apply the requested fraction after those
+		// passes; otherwise a stale native scroll offset can leave a fresh book at
+		// the bottom even when its stored position is the beginning.
+		this.queueContinuousRestore(pct);
+		this.syncContinuousPosition();
+		this.renderSavedHighlights();
+		this.hideAnnotationPreview();
+		this.updateProgress();
+		this.updateTocActive();
+		this.schedulePositionSave();
+	}
+
+	private scrollContinuousToFraction(pct: number, behavior: ScrollBehavior = "smooth"): void {
+		if (!this.spreadEl || !this.isContinuousFlow()) return;
+		this.spreadEl.scrollTo({
+			top: readerScrollOffset(pct, this.spreadEl.scrollHeight, this.spreadEl.clientHeight),
+			behavior,
+		});
+	}
+
+	/** Restore a continuous-flow position after the browser and ItemView have
+	 *  completed their own scroll/layout work. A couple of animation frames cover the
+	 *  common base-state + image/font layout race without fighting normal user
+	 *  scrolling after the book is visible. */
+	private queueContinuousRestore(pct: number): void {
+		if (!this.spreadEl || !this.isContinuousFlow()) return;
+		const value = clampReaderFraction(pct);
+		let frame = 0;
+		const restore = (): void => {
+			if (!this.spreadEl || !this.isContinuousFlow() || !this.spreadEl.isConnected) return;
+			this.scrollContinuousToFraction(value, "auto");
+			if (frame++ < 1) requestAnimationFrame(restore);
+		};
+		requestAnimationFrame(restore);
+	}
+
+	private scrollContinuousToUnit(unitIdx: number): void {
+		if (!this.contentNode || !this.isContinuousFlow()) return;
+		const clamped = Math.max(0, Math.min(unitIdx, this.units.length - 1));
+		const spine = this.units[clamped]?.startSpine ?? 0;
+		const target = this.contentNode.querySelector<HTMLElement>(`.clp-spine-item[data-spine-index="${spine}"]`);
+		if (target) this.scrollToTarget(target);
+		this.currentUnitIndex = clamped;
+		this.currentSpread = 0;
+		this.spineIndex = spine;
+		this.updateProgress();
+		this.updateTocActive();
+		this.schedulePositionSave();
+	}
+
+	private syncContinuousPosition(): void {
+		if (!this.spreadEl || !this.contentNode || !this.isContinuousFlow()) return;
+		const viewportTop = this.spreadEl.getBoundingClientRect().top + 24;
+		let activeSpine = 0;
+		for (const item of Array.from(this.contentNode.querySelectorAll<HTMLElement>(".clp-spine-item[data-spine-index]"))) {
+			if (item.getBoundingClientRect().top > viewportTop) break;
+			const index = Number(item.dataset.spineIndex);
+			if (Number.isFinite(index)) activeSpine = index;
+		}
+		this.spineIndex = activeSpine;
+		const sectionIndex = this.sectionIndexBySpine[activeSpine] ?? 0;
+		const section = this.sections[sectionIndex];
+		this.currentUnitIndex = section ? (this.unitIndexBySection.get(section.id) ?? sectionIndex) : 0;
+		this.currentSpread = 0;
+	}
+
+	private rebuildOffsets(): void {
+		let unitAcc = 0;
+		this.unitStartSpreads = this.units.map((u) => {
+			const v = unitAcc;
+			unitAcc += u.spreadCount;
+			return v;
+		});
+		this.totalSpreads = Math.max(1, unitAcc);
+
+		this.sectionStartSpreads = new Array<number>(this.sections.length).fill(0);
+		this.units.forEach((unit, unitIdx) => {
+			const base = this.unitStartSpreads[unitIdx] ?? 0;
+			unit.sectionIds.forEach((id, idx) => {
+				const sectionIdx = this.sectionIndexById.get(id);
+				if (sectionIdx === undefined) return;
+				const offset = unit.sectionOffsets[idx] ?? 0;
+				this.sectionStartSpreads[sectionIdx] = base + offset;
+			});
+		});
+	}
+
+	/** Cache key for a unit's rendered DOM. Spine range, not unit index: unit
+	 *  indices shift when pairing changes across rebuilds, but the same spine
+	 *  range always renders the same DOM. */
+	private unitDomKey(unit: RenderUnit): string {
+		return `${unit.startSpine}-${unit.endSpine}`;
+	}
+
+	private async getUnitDom(unitIdx: number): Promise<HTMLElement | null> {
+		if (!this.book) return null;
+		const unit = this.units[unitIdx];
+		if (!unit) return null;
+		const key = this.unitDomKey(unit);
+		const existing = this.unitDomCache.get(key);
+		if (existing) return existing;
+
+		const node = document.createElement("div");
+		node.className = "clp-unit";
+		await renderSpineRange(this.book, unit.startSpine, unit.endSpine, node);
+		decorateBilingualContent(node, this.currentFile ? this.plugin.settings.bilingualBooks[this.currentFile.path] : undefined);
+		this.annotateItalicBlocks(node);
+		this.offsetMap.prepareUnit(node);
+		this.unitDomCache.set(key, node);
+		return node;
+	}
+
+	private async mountCurrentUnit(unitIdx: number, spread: number): Promise<void> {
+		if (this.isContinuousFlow() && this.hasMountedUnit) {
+			this.scrollContinuousToUnit(unitIdx);
+			return;
+		}
+		if (this.isGlossActive()) this.dismissGloss();
+		const token = ++this.renderToken;
+		this.currentUnitIndex = Math.max(0, Math.min(unitIdx, this.units.length - 1));
+		const unit = this.units[this.currentUnitIndex];
+		if (!unit || !this.contentNode) return;
+
+		const currentDom = await this.getUnitDom(this.currentUnitIndex);
+		if (token !== this.renderToken || !currentDom || !this.contentNode) return;
+
+		this.contentNode.empty();
+		this.contentNode.appendChild(currentDom);
+		this.applyContentLayout(unit);
+		this.preloadLinkPreviewsForUnit(currentDom);
+		this.buildTocAnchorPageMap();
+		this.currentSpread = Math.max(0, Math.min(spread, unit.spreadCount - 1));
+		this.goToSpread(this.currentSpread);
+		this.renderSavedHighlights();
+		this.hideAnnotationPreview();
+		await this.mountAdjacentUnits();
+		this.updateProgress();
+		this.updateTocActive();
+		this.hasMountedUnit = true;
+		this.schedulePositionSave();
+	}
+
+	private async mountAdjacentUnits(): Promise<void> {
+		if (!this.prevHost || !this.nextHost) return;
+		const prevIdx = this.currentUnitIndex - 1;
+		const nextIdx = this.currentUnitIndex + 1;
+
+		const prevKey = this.units[prevIdx] ? this.unitDomKey(this.units[prevIdx]) : "";
+		const nextKey = this.units[nextIdx] ? this.unitDomKey(this.units[nextIdx]) : "";
+
+		if (prevIdx >= 0) {
+			const prevDom = await this.getUnitDom(prevIdx);
+			if (prevDom && this.mountedUnitKeys.prev !== prevKey) {
+				this.prevHost.empty();
+				this.prevHost.appendChild(prevDom);
+				this.mountedUnitKeys.prev = prevKey;
+			}
+		} else if (this.mountedUnitKeys.prev !== "") {
+			this.prevHost.empty();
+			this.mountedUnitKeys.prev = "";
+		}
+
+		if (nextIdx < this.units.length) {
+			const nextDom = await this.getUnitDom(nextIdx);
+			if (nextDom && this.mountedUnitKeys.next !== nextKey) {
+				this.nextHost.empty();
+				this.nextHost.appendChild(nextDom);
+				this.mountedUnitKeys.next = nextKey;
+			}
+		} else if (this.mountedUnitKeys.next !== "") {
+			this.nextHost.empty();
+			this.mountedUnitKeys.next = "";
+		}
+
+		const currentUnit = this.units[this.currentUnitIndex];
+		const keep = new Set(
+			[currentUnit, this.units[prevIdx], this.units[nextIdx]]
+				.filter((u): u is RenderUnit => !!u)
+				.map((u) => this.unitDomKey(u)),
+		);
+		for (const [key, node] of Array.from(this.unitDomCache.entries())) {
+			if (!keep.has(key)) {
+				node.remove();
+				this.unitDomCache.delete(key);
+			}
+		}
+	}
+
+	// ─── REGION: Navigation ──────────────────────────────────────────────────
+	private getCurrentUnit(): RenderUnit | null {
+		return this.units[this.currentUnitIndex] ?? null;
+	}
+
+	private getCurrentSectionIndex(): number {
+		const unit = this.getCurrentUnit();
+		if (!unit) return 0;
+		for (let i = 0; i < unit.sectionIds.length; i++) {
+			const id = unit.sectionIds[i];
+			const idx = this.sectionIndexById.get(id);
+			if (idx === undefined) continue;
+			const count = this.sectionSpreadCounts[idx] ?? 1;
+			const start = unit.sectionOffsets[i] ?? 0;
+			if (this.currentSpread >= start && this.currentSpread < start + count) return idx;
+		}
+		const first = unit.sectionIds[0];
+		return this.sectionIndexById.get(first) ?? 0;
+	}
+
+	private getSpreadOffsetWithinUnit(sectionIdx: number): number {
+		const unit = this.getCurrentUnit();
+		if (!unit) return 0;
+		for (let i = 0; i < unit.sectionIds.length; i++) {
+			const idx = this.sectionIndexById.get(unit.sectionIds[i]);
+			if (idx === sectionIdx) return unit.sectionOffsets[i] ?? 0;
+		}
+		return 0;
+	}
+
+	private getGlobalSpread(): number {
+		return (this.unitStartSpreads[this.currentUnitIndex] ?? 0) + this.currentSpread;
+	}
+
+	async advance(): Promise<void> {
+		if (this.isContinuousFlow() && this.spreadEl) {
+			this.spreadEl.scrollBy({ top: Math.max(120, this.spreadEl.clientHeight * 0.88), behavior: "smooth" });
+			this.registerReadingTurn();
+			return;
+		}
+		const unit = this.getCurrentUnit();
+		if (!unit) return;
+		// While extending, keep the selection alive across the turn so the far
+		// endpoint can be set on a later spread.
+		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
+		if (this.currentSpread < unit.spreadCount - 1) {
+			this.goToSpread(this.currentSpread + 1);
+			this.registerReadingTurn();
+			return;
+		}
+		if (this.currentUnitIndex < this.units.length - 1) {
+			await this.mountCurrentUnit(this.currentUnitIndex + 1, 0);
+			this.registerReadingTurn();
+		}
+	}
+
+	async retreat(): Promise<void> {
+		if (this.isContinuousFlow() && this.spreadEl) {
+			this.spreadEl.scrollBy({ top: -Math.max(120, this.spreadEl.clientHeight * 0.88), behavior: "smooth" });
+			this.registerReadingTurn();
+			return;
+		}
+		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
+		if (this.currentSpread > 0) {
+			this.goToSpread(this.currentSpread - 1);
+			this.registerReadingTurn();
+			return;
+		}
+		if (this.currentUnitIndex > 0) {
+			const prevUnit = this.units[this.currentUnitIndex - 1];
+			await this.mountCurrentUnit(this.currentUnitIndex - 1, Math.max(0, prevUnit.spreadCount - 1));
+			this.registerReadingTurn();
+		}
+	}
+
+	/** Tally reader-driven page-turns and expire the return anchor after
+	 *  {@link BACK_PILL_COMMIT_TURNS} of them.
+	 *
+	 *  Direction-agnostic: counting only turns *away* and resetting on a turn
+	 *  back lets ordinary back-and-forth reading keep the pill alive
+	 *  indefinitely. Any three turns is enough evidence the reader has moved on.
+	 *
+	 *  Expiring the anchor outright, rather than just fading the pill, also
+	 *  retires the dot — which has no way to stay inside the progress bar once
+	 *  the bar expands under the mobile chrome.
+	 *
+	 *  Seeks and jumps bypass this (they don't route through advance/retreat),
+	 *  which is intended: only linear reading counts as moving on. */
+	private registerReadingTurn(): void {
+		if (!this.previousPosition) return;
+		if (++this.turnsSinceAnchor < BACK_PILL_COMMIT_TURNS) return;
+		this.previousPosition = null;
+		this.turnsSinceAnchor = 0;
+		this.updateBackMarker();
+	}
+
+	private goToSpread(n: number): void {
+		if (this.isContinuousFlow()) return;
+		const unit = this.getCurrentUnit();
+		if (!this.contentNode || !unit) return;
+		const clamped = Math.max(0, Math.min(n, unit.spreadCount - 1));
+		const stride = this.getNavigationStride();
+		this.currentSpread = clamped;
+		// Far jumps snap instead of sliding. Animating thousands of px in
+		// 250ms reads as a blur at best — and on translucent themes the
+		// compositor leaves every intermediate frame as a trail over the
+		// transparent backdrop (the conversation-jump "smear"). Only
+		// adjacent page turns keep the transition.
+		const targetX = clamped * stride;
+		const liveTransform = getComputedStyle(this.contentNode).transform;
+		const liveX = liveTransform === "none" ? 0 : -new DOMMatrixReadOnly(liveTransform).m41;
+		if (Math.abs(liveX - targetX) > stride * 1.5) {
+			this.contentNode.addClass("clp-no-transition");
+			this.contentNode.style.transform = `translateX(-${targetX}px)`;
+			void this.contentNode.offsetWidth; // commit without transition
+			this.contentNode.removeClass("clp-no-transition");
+		} else {
+			this.contentNode.style.transform = `translateX(-${targetX}px)`;
+		}
+		const sectionIdx = this.getCurrentSectionIndex();
+		this.spineIndex = this.sections[sectionIdx]?.startSpine ?? 0;
+		this.posAnchor = {
+			sectionIdx,
+			offset: clamped - this.getSpreadOffsetWithinUnit(sectionIdx),
+			count: Math.max(1, this.sectionSpreadCounts[sectionIdx] ?? 1),
+		};
+		this.updateProgress();
+		this.updateTocActive();
+	}
+
+	private getPageWidth(): number {
+		if (!this.spreadEl) return 0;
+		const cs = getComputedStyle(this.spreadEl);
+		return this.spreadEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+	}
+
+	private paginateVisibleContent(): void {
+		if (!this.spreadEl || !this.contentNode) return;
+		this.applyPagination(this.spreadEl, this.contentNode);
+	}
+
+	/** Apply the correct column layout for the given unit.
+	 *  Single-page units get a centered narrow column; all others get the
+	 *  standard two-column spread layout. */
+	private applyContentLayout(unit: RenderUnit): void {
+		if (!this.contentNode) return;
+		this.syncSpreadLayoutMode(this.spreadEl);
+		if (this.layoutMode === "single") {
+			this.contentNode.removeClass("clp-single-page");
+			this.paginateVisibleContent();
+			return;
+		}
+		if (unit.singlePage) {
+			// Clear inline column styles so the CSS class takes over
+			this.contentNode.style.removeProperty("column-width");
+			this.contentNode.style.removeProperty("column-gap");
+			this.contentNode.addClass("clp-single-page");
+		} else {
+			this.contentNode.removeClass("clp-single-page");
+			this.paginateVisibleContent();
+		}
+	}
+
+	/** Append a geometry pass to the serial chain. Passes never overlap — a
+	 *  rebuild in flight finishes before the next starts — which is the whole
+	 *  point: concurrent passes interleave on the shared section arrays,
+	 *  measurement caches, and measurement DOM node. */
+	private runLayoutPass(fn: () => Promise<void>): Promise<void> {
+		const run = this.layoutChain.then(fn).catch((err) => {
+			console.error("[ComprehensibleLearningPortal] layout pass failed", err);
+		});
+		this.layoutChain = run;
+		return run;
+	}
+
+	/** True while the on-screen keyboard is up. `Platform.mobileSoftKeyboardVisible`
+	 *  is Obsidian's own flag — it gates their navbar auto-hide the same way — but
+	 *  it isn't in the public typings, so it's read defensively and backed by the
+	 *  question it stands in for: does one of our own fields have focus. Either
+	 *  alone would do most of the time; together they cover a stale flag and a
+	 *  keyboard raised by something other than a tap. */
+	/** Pin the spread to its current height before the on-screen keyboard opens,
+	 *  so the multicol box it wraps keeps its geometry when the layout viewport
+	 *  shrinks underneath it. Driven from `focusin`, which lands before the
+	 *  keyboard animates in — measuring after the resize would already be
+	 *  measuring the collapsed box. Released by the next resize pass that runs
+	 *  with the keyboard down (see queueResize). */
+	private freezeSpreadHeight(): void {
+		const spread = this.spreadEl;
+		if (!Platform.isMobile || !spread) return;
+		const h = spread.clientHeight;
+		if (h > 0) this.frozenSpreadH = h;
+		this.applyFrozenHeight();
+	}
+
+	/** Re-assert the pin from the stored height. Separate from the measurement
+	 *  so a layout pass or remount that lands between focus and the keyboard
+	 *  can't lose it — re-measuring at that point would capture the collapsed
+	 *  box and pin the reader to it. */
+	private applyFrozenHeight(): void {
+		if (this.frozenSpreadH <= 0) return;
+		this.contentEl.style.setProperty("--clp-frozen-h", `${this.frozenSpreadH}px`);
+		this.contentEl.addClass("clp-kbd-frozen");
+	}
+
+	private softKeyboardUp(): boolean {
+		if (!Platform.isMobile) return false;
+		const flagged = (Platform as unknown as { mobileSoftKeyboardVisible?: boolean })
+			.mobileSoftKeyboardVisible;
+		return flagged === true || isTextInputFocused();
+	}
+
+	/** Debounced ResizeObserver entry point. Coalesces: only the newest queued
+	 *  pass runs; a pass superseded while waiting in the chain is skipped, and
+	 *  one superseded mid-rebuild bails early via the staleness probe. */
+	private queueResize(): void {
+		// The on-screen keyboard shrinks Obsidian's own app container on mobile, so
+		// opening it fires a resize and the book repaginates into the ~130px strip
+		// left above it — the whole spread crushed into a few lines, then rebuilt
+		// again on dismissal. Skip the pass
+		// entirely. Dismissing the keyboard grows the container back, which fires
+		// the observer again, so the deferred pass arrives on its own. (Note the
+		// *layout* viewport does not shrink with it — a `position: fixed` floater
+		// still measures against the full screen; see `layoutDockedInput`.)
+		//
+		// Skipping our pass is only half of it, and the half that was missing
+		// until device testing: `.clp-content` is `height: 100%` of a `flex: 1`
+		// spread, so a shorter root re-flows the *CSS multicol* on its own, with
+		// no JS involved — the text redistributes into more columns while our
+		// translateX still points at the old ones, which is why the page came
+		// back blank with the odd stranded line. `clp-kbd-frozen` pins the
+		// spread's height so the column box never changes size and there is
+		// nothing to reflow; the shorter root just clips it, under the keyboard.
+		if (this.softKeyboardUp()) {
+			this.applyFrozenHeight();
+			return;
+		}
+		this.contentEl.removeClass("clp-kbd-frozen");
+		const id = ++this.layoutPassId;
+		void this.runLayoutPass(async () => {
+			if (id !== this.layoutPassId) return;
+			await this.handleResize(() => id !== this.layoutPassId);
+		});
+	}
+
+	private async handleResize(isStale?: () => boolean): Promise<void> {
+		if (!this.book || !this.spreadEl) {
+			this.paginateVisibleContent();
+			this.goToSpread(this.currentSpread);
+			return;
+		}
+
+		// If the leaf is hidden (background tab, collapsed split, minimised
+		// window) the spread element's client dimensions drop to 0. Running
+		// the rebuild path here measures against zero-sized geometry and
+		// poisons the pagination model — symptoms are NaN page counters and
+		// a dead progress bar once the view is brought back to the front.
+		// Defer entirely; the next resize fired while visible will recover.
+		if (this.spreadEl.clientWidth <= 0 || this.spreadEl.clientHeight <= 0) {
+			return;
+		}
+		if (this.isContinuousFlow()) {
+			this.renderSavedHighlights();
+			return;
+		}
+
+		// Ensure the pane has stopped animating before reading geometry.
+		// Without this, a hover-peek sidebar closing mid-debounce can fire
+		// handleResize while clientWidth is still in motion, and we either
+		// rebuild against the wrong bucket or skip the rebuild entirely.
+		await this.waitForStableGeometry();
+
+		// Re-check visibility after the wait — the view could have been
+		// hidden during the stability window (e.g. user tabbed away).
+		if (!this.spreadEl || this.spreadEl.clientWidth <= 0 || this.spreadEl.clientHeight <= 0) {
+			return;
+		}
+		this.layoutMode = this.resolveLayoutMode();
+		this.syncSpreadLayoutMode(this.spreadEl);
+
+		// Re-seek from the durable anchor, not from live model state — this
+		// pass may run while another has this.units mid-rebuild (see posAnchor).
+		const anchor = this.posAnchor;
+		const oldSectionIdx = anchor?.sectionIdx ?? this.getCurrentSectionIndex();
+		const oldSectionSpreadOffset = anchor?.offset ?? (this.currentSpread - this.getSpreadOffsetWithinUnit(oldSectionIdx));
+		const oldSectionCount = anchor?.count ?? Math.max(1, this.sectionSpreadCounts[oldSectionIdx] ?? 1);
+		const bucket = this.getLayoutBucketKey();
+		if (bucket === this.measurementBucketKey) {
+			const unit = this.getCurrentUnit();
+			if (unit) this.applyContentLayout(unit);
+			else this.paginateVisibleContent();
+			this.goToSpread(this.currentSpread);
+			// The one resize path that doesn't reach `mountCurrentUnit`, and so
+			// the one that used to leave the highlight overlay behind: the rects
+			// are absolute boxes measured off `getClientRects()` at paint time,
+			// so anything that re-lays-out the column box without repainting
+			// them strands them at their old coordinates. Same bucket means the
+			// geometry *should* be identical and the repaint a no-op — but
+			// "should" is doing the work there, and an orphaned highlight is a
+			// a real risk. Repainting unconditionally costs one
+			// pass over the saved list and removes the doubt.
+			this.renderSavedHighlights();
+			return;
+		}
+
+		// Remember exactly where we are in the bucket we're leaving, so a
+		// round-trip back restores this spot instead of re-deriving it.
+		if (this.measurementBucketKey) {
+			this.lastPositionByBucket.set(this.measurementBucketKey, {
+				unitIndex: this.currentUnitIndex,
+				spread: this.currentSpread,
+			});
+		}
+
+		// Caches are NOT cleared here: measurement entries are keyed by geometry
+		// bucket and unit DOM is geometry-independent, so both stay valid across
+		// resizes. Returning to a previously-seen pane size is all cache hits.
+		await this.buildRenderUnits(isStale);
+		if (isStale?.()) {
+			// Superseded mid-build: the model is part-built for a bucket we never
+			// committed. Blank the key so the successor pass can't short-circuit
+			// against it, and let that pass rebuild + remount cleanly.
+			this.measurementBucketKey = "";
+			return;
+		}
+		this.measurementBucketKey = bucket;
+
+		const section = this.sections[oldSectionIdx];
+		if (!section) {
+			// Can't resolve the section — clamp to the nearest valid unit
+			// instead of teleporting to the cover.
+			await this.mountCurrentUnit(Math.min(this.currentUnitIndex, this.units.length - 1), 0);
+			return;
+		}
+
+		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const targetOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
+		const sectionCount = this.sectionSpreadCounts[oldSectionIdx] ?? 1;
+		// Scale the in-section offset by the count ratio so a mode flip lands on
+		// the equivalent position: spread→single hits the LEFT page of the old
+		// spread (s → 2s), single→spread the spread containing the old page
+		// (p → ⌊p/2⌋). Same-mode rebuilds scale 1:1 and behave as before.
+		const scaledOffset = Math.floor((oldSectionSpreadOffset * sectionCount) / oldSectionCount);
+		const targetSpread = targetOffset + Math.max(0, Math.min(scaledOffset, sectionCount - 1));
+
+		// Round-trip restore: units are deterministic per bucket (measurements
+		// come from the bucket-keyed cache), so a memo from the last visit to
+		// this bucket is exact. Trust it only when the scaled estimate lands on
+		// or one spread below it — that window is precisely the floor()'s drift,
+		// so real navigation while away (≥1 spread the other way) wins instead.
+		const memo = this.lastPositionByBucket.get(bucket);
+		if (memo && memo.unitIndex < this.units.length) {
+			const memoGlobal = (this.unitStartSpreads[memo.unitIndex] ?? 0) + memo.spread;
+			const targetGlobal = (this.unitStartSpreads[targetUnitIdx] ?? 0) + targetSpread;
+			const drift = memoGlobal - targetGlobal;
+			if (drift >= 0 && drift <= 1) {
+				await this.mountCurrentUnit(memo.unitIndex, memo.spread);
+				return;
+			}
+		}
+		await this.mountCurrentUnit(targetUnitIdx, targetSpread);
+	}
+
+	private getSpreadOffsetInUnitBySectionId(unit: RenderUnit | undefined, sectionId: string): number {
+		if (!unit) return 0;
+		for (let i = 0; i < unit.sectionIds.length; i++) {
+			if (unit.sectionIds[i] === sectionId) return unit.sectionOffsets[i] ?? 0;
+		}
+		return 0;
+	}
+
+	private findTarget(id: string): Element | null {
+		if (!id || !this.contentNode) return null;
+		try {
+			return this.contentNode.querySelector(`#${CSS.escape(id)}`);
+		} catch {
+			return null;
+		}
+	}
+
+	private scrollToTarget(target: Element): void {
+		if (this.isContinuousFlow()) {
+			target.scrollIntoView({ block: "start", behavior: "smooth" });
+			return;
+		}
+		this.scrollToX(target.getBoundingClientRect().left);
+	}
+
+	/** Bring the spread containing viewport-x `left` into view.
+	 *
+	 *  Split out from `scrollToTarget` because an *element's* rect is the wrong
+	 *  input for anything smaller than the element: `getBoundingClientRect`
+	 *  returns the union of a fragmented paragraph's pieces, so its `left` is
+	 *  always the page the paragraph starts on. Callers that know a finer
+	 *  position — a highlight's own line boxes — pass that instead. */
+	private scrollToX(left: number): void {
+		if (!this.contentNode) return;
+		const pageWidth = this.getPageWidth();
+		if (pageWidth <= 0) return;
+		const contentRect = this.contentNode.getBoundingClientRect();
+		const offsetX = left - contentRect.left;
+		const spread = Math.floor(offsetX / this.getNavigationStride());
+		const unit = this.getCurrentUnit();
+		if (unit && spread >= 0 && spread < unit.spreadCount) this.goToSpread(spread);
+	}
+
+	private getReadableLineWidth(): number {
+		const raw = getComputedStyle(this.contentEl).getPropertyValue("--clp-line-width").trim();
+		const width = parseFloat(raw);
+		return Number.isFinite(width) && width > 0 ? width : 680;
+	}
+
+	/** The spread's computed body size in px — Obsidian's own text-size setting
+	 *  flows through to this, so anything measuring "how much text fits" must
+	 *  scale by it rather than assuming a fixed px budget. */
+	private getSpreadFontSize(spread: HTMLElement | null = this.spreadEl): number {
+		if (!spread) return 16;
+		const fontSize = parseFloat(getComputedStyle(spread).fontSize);
+		return Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 16;
+	}
+
+	/** The floor of `--clp-side-pad`, resolved to px. Reads the
+	 *  `--clp-side-pad-min` token rather than restating its value, so a media
+	 *  query that narrows the gutter (phones do) moves the layout breakpoint
+	 *  with it instead of silently desynchronising the two.
+	 *  `getComputedStyle` does not resolve custom properties to px, so the unit
+	 *  is converted here: rem against the document root, em against the spread. */
+	private getMinSidePaddingPx(spread: HTMLElement | null = this.spreadEl): number {
+		if (!spread) return 72;
+		const raw = getComputedStyle(spread).getPropertyValue("--clp-side-pad-min").trim();
+		const value = parseFloat(raw);
+		if (!Number.isFinite(value)) return this.getSpreadFontSize(spread) * 4.5;
+		if (raw.endsWith("rem")) {
+			const rootSize = parseFloat(getComputedStyle(document.documentElement).fontSize);
+			return value * (Number.isFinite(rootSize) && rootSize > 0 ? rootSize : 16);
+		}
+		if (raw.endsWith("em")) return value * this.getSpreadFontSize(spread);
+		return value; // already px
+	}
+
+	private getLayoutCandidateWidth(spread: HTMLElement | null = this.spreadEl): number {
+		if (!spread) return 0;
+		return Math.max(100, spread.clientWidth - this.getMinSidePaddingPx(spread) * 2);
+	}
+
+	/** Electron UI-zoom factor (Cmd +/-): 1 at the default scale, >1 zoomed in,
+	 *  <1 zoomed out. Falls back to 1 if unavailable.
+	 *
+	 *  Gated rather than left to the catch: mobile has no `require`, and this
+	 *  runs on every layout pass, so the throw meant a ReferenceError plus an
+	 *  Obsidian log line on every resize.
+	 *
+	 *  isMobile, not isDesktopApp: this feeds `resolveLayoutMode`, gated the
+	 *  same way, and under `emulateMobile` the mobile layout path is what we
+	 *  want. A device has no webFrame zoom, so 1 is the right answer there
+	 *  rather than a fallback. */
+	private getZoomFactor(): number {
+		if (Platform.isMobile) return 1;
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's webFrame is only reachable via require() in Obsidian's renderer.
+			const { webFrame } = require("electron") as { webFrame: { getZoomFactor: () => number } };
+			const factor = webFrame.getZoomFactor();
+			return Number.isFinite(factor) && factor > 0 ? factor : 1;
+		} catch {
+			return 1;
+		}
+	}
+
+	private resolveLayoutMode(
+		candidateWidth = this.getLayoutCandidateWidth(),
+		previous: LayoutMode = this.layoutMode,
+	): LayoutMode {
+		// Decide on the *physical* pane width. `clientWidth` is reported in CSS
+		// pixels that shrink as UI zoom (Cmd +/-) rises, but the breakpoint is
+		// anchored to the fixed `--clp-line-width`; comparing the two frames let
+		// a non-default UI scale collapse a comfortably-wide window into
+		// single-page. Multiplying by the zoom factor ties the decision to the
+		// physical window size, so the spread is stable across UI scales (and
+		// identical to the old behaviour at the default scale, where factor = 1).
+		const physicalWidth = candidateWidth * this.getZoomFactor();
+		const readableWidth = this.getReadableLineWidth();
+		// Layout decision, so this keys off isMobile (UX) rather than
+		// isDesktopApp (capability) — under `emulateMobile` we want the tablet
+		// behaviour, which is the whole point of being able to emulate it.
+		const mobile = Platform.isMobile;
+		const minSpreadCol = mobile
+			? ReaderView.SINGLE_PAGE_MOBILE_MIN_COL_EM * this.getSpreadFontSize()
+			: Math.max(
+				ReaderView.SINGLE_PAGE_MIN_SPREAD_COL,
+				Math.min(ReaderView.SINGLE_PAGE_MAX_SPREAD_COL, readableWidth * ReaderView.SINGLE_PAGE_BREAK_RATIO),
+			);
+		const breakpoint = minSpreadCol * 2 + ReaderView.GAP;
+		// Mobile width changes only in one discrete jump, on rotation, so the
+		// desktop anti-flap band is a liability here — see the constant's doc.
+		const hysteresis = mobile
+			? ReaderView.SINGLE_PAGE_MOBILE_HYSTERESIS
+			: ReaderView.SINGLE_PAGE_HYSTERESIS;
+		if (previous === "single") {
+			return physicalWidth > breakpoint + hysteresis ? "spread" : "single";
+		}
+		return physicalWidth < breakpoint - hysteresis ? "single" : "spread";
+	}
+
+	private syncSpreadLayoutMode(spread: HTMLElement | null, mode: LayoutMode = this.layoutMode): void {
+		if (!spread) return;
+		spread.toggleClass("clp-layout-single", mode === "single");
+		// Mirrored onto the root so the footer's `--clp-side-pad` tracks the
+		// spread's — the progress bar spans the reading column, not the pane.
+		this.contentEl.toggleClass("clp-layout-single", mode === "single");
+	}
+
+	private getColumnGap(mode: LayoutMode = this.layoutMode, spread: HTMLElement | null = this.spreadEl): number {
+		return mode === "single" ? this.getSinglePageGap(spread) : ReaderView.GAP;
+	}
+
+	private getNavigationStride(): number {
+		return this.getPageWidth() + this.getColumnGap();
+	}
+
+	private getSinglePageGap(spread: HTMLElement | null = this.spreadEl): number {
+		if (!spread) return this.getMinSidePaddingPx(spread);
+		const cs = getComputedStyle(spread);
+		const left = parseFloat(cs.paddingLeft);
+		const right = parseFloat(cs.paddingRight);
+		const gap = Math.min(
+			Number.isFinite(left) ? left : this.getMinSidePaddingPx(spread),
+			Number.isFinite(right) ? right : this.getMinSidePaddingPx(spread),
+		);
+		return Math.max(this.getMinSidePaddingPx(spread), gap);
+	}
+
+	/** Raise whatever floater the pointer sits over — a citation's own text, a
+	 *  cross-document link preview, or an in-document cross-reference. Returns the
+	 *  element the floater belongs to, or null when the position resolves to
+	 *  nothing worth showing. Shared by the desktop hover path and the touch tap
+	 *  path so the two can't drift apart. */
+	private showReferenceTooltip(e: MouseEvent): Element | null {
+		const target = e.target as Element;
+		const cite = target.closest<HTMLElement>(".clp-citation");
+		const anchor = target.closest<HTMLAnchorElement>("a[href]");
+		const ridEl = target.closest<HTMLElement>("[data-rid]");
+
+		if (cite) {
+			const text = cite.dataset.citeText;
+			if (!text) return null;
+			this.renderTooltip(this.buildInlineTextPreview(text), e);
+			return cite;
+		}
+		if (anchor) {
+			// Only claim the anchor if a floater actually went up. Reporting a
+			// tooltip that never rendered is what makes the touch two-step eat a
+			// tap and show nothing for it.
+			return this.handleLinkHover(anchor, e) ? anchor : null;
+		}
+		if (ridEl?.dataset.rid) {
+			const targetEl = this.findTarget(ridEl.dataset.rid);
+			if (!targetEl) return null;
+			this.showTooltip(targetEl, e);
+			return ridEl;
+		}
+		return null;
+	}
+
+	/** Touch two-step for footnotes and citations: the first tap raises the same
+	 *  floater a mouse gets on hover, the second follows the reference. Without it
+	 *  a footnote marker is pure navigation on a phone — you are moved to the note
+	 *  before you can read it, which is the opposite of what a footnote is for.
+	 *
+	 *  Scoped to references that resolve *inside* the book. An external link has
+	 *  no preview to show, so a two-step there would be a tax with nothing bought;
+	 *  those still open on the first tap.
+	 *
+	 *  "Inside the book" is any in-book anchor, not just a same-document one:
+	 *  books whose footnotes live in a separate notes file don't match
+	 *  `a[href^="#"]`, and would navigate on the first tap while previewing fine
+	 *  on desktop hover. Which references are previewable is
+	 *  showReferenceTooltip's call, not the selector's.
+	 *
+	 *  Returns true when the tap was spent raising the floater. */
+	private handleReferenceTap(e: MouseEvent): boolean {
+		const ref = (e.target as Element).closest<HTMLElement>(
+			".clp-citation, [data-rid], a[href]"
+		);
+		if (!ref) return false;
+		// Second tap on the same marker follows it — fall through to the caller's
+		// navigation, having put the floater away first.
+		if (this.referenceTapEl === ref) {
+			this.hideTooltip();
+			return false;
+		}
+		if (!this.showReferenceTooltip(e)) return false;
+		this.referenceTapEl = ref;
+		return true;
+	}
+
+	/** Returns whether a floater was raised (or is certain to be, once an
+	 *  in-flight preview resolves). The touch two-step reads it to decide
+	 *  whether the tap was spent; the desktop hover path ignores it. */
+	private handleLinkHover(anchor: HTMLAnchorElement, e: MouseEvent): boolean {
+		const href = anchor.getAttribute("href")?.trim() ?? "";
+		if (!href || href.startsWith("http") || href.startsWith("mailto:")) return false;
+
+		if (href.startsWith("#")) {
+			const targetEl = this.findTarget(href.slice(1));
+			if (!targetEl) return false;
+			this.showTooltip(targetEl, e);
+			return true;
+		}
+
+		const key = this.getLinkPreviewKey(anchor);
+		if (!key) return false;
+
+		this.hoveredLinkPreviewKey = key;
+		const cached = this.linkPreviewCache.get(key);
+		if (cached) {
+			this.showTooltipPreview(cached, e);
+			return true;
+		}
+		// Cached as null = already looked, nothing there. Follow it on the first
+		// tap rather than charging one for an empty floater.
+		if (this.linkPreviewCache.has(key)) return false;
+
+		// Uncached is rare — preloadLinkPreviewsForUnit warms every cross-document
+		// anchor when the unit mounts — so claim the tap and let it land late.
+		void this.ensureLinkPreview(anchor).then((preview) => {
+			if (this.hoveredLinkPreviewKey !== key) return;
+			if (!preview) {
+				// Nothing to show after all: hand the reference back so the next
+				// tap follows it instead of waiting on a floater that isn't coming.
+				if (this.referenceTapEl === anchor) this.referenceTapEl = null;
+				return;
+			}
+			this.showTooltipPreview(preview, e);
+		});
+		return true;
+	}
+
+	private preloadLinkPreviewsForUnit(unitRoot: HTMLElement): void {
+		const seen = new Set<string>();
+		unitRoot.querySelectorAll("a[href]").forEach((anchorEl) => {
+			const anchor = anchorEl as HTMLAnchorElement;
+			const key = this.getLinkPreviewKey(anchor);
+			if (!key || seen.has(key)) return;
+			seen.add(key);
+			void this.ensureLinkPreview(anchor);
+		});
+	}
+
+	private getLinkPreviewKey(anchor: HTMLAnchorElement): string | null {
+		const href = anchor.getAttribute("href")?.trim() ?? "";
+		if (!href || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//")) {
+			return null;
+		}
+		const baseHref = this.getAnchorSourceHref(anchor);
+		if (!baseHref) return null;
+		return resolveEpubHref(baseHref, href)?.resolvedHref ?? null;
+	}
+
+	private getAnchorSourceHref(anchor: HTMLAnchorElement): string | null {
+		if (!this.book) return null;
+		const spineHost = anchor.closest<HTMLElement>(".clp-spine-item");
+		const spineIndex = parseInt(spineHost?.dataset.spineIndex ?? "", 10);
+		if (Number.isFinite(spineIndex) && this.book.spine[spineIndex]) {
+			return this.book.spine[spineIndex].href;
+		}
+		return this.book.spine[this.spineIndex]?.href ?? null;
+	}
+
+	private ensureLinkPreview(anchor: HTMLAnchorElement): Promise<EpubLinkPreview | null> {
+		if (!this.book) return Promise.resolve(null);
+		const href = anchor.getAttribute("href")?.trim() ?? "";
+		const baseHref = this.getAnchorSourceHref(anchor);
+		const key = baseHref ? this.getLinkPreviewKey(anchor) : null;
+		if (!href || !baseHref || !key) return Promise.resolve(null);
+
+		if (this.linkPreviewCache.has(key)) {
+			return Promise.resolve(this.linkPreviewCache.get(key) ?? null);
+		}
+
+		const pending = this.linkPreviewPending.get(key);
+		if (pending) return pending;
+
+		const task = extractLinkPreview(this.book, baseHref, href)
+			.then((preview) => {
+				this.linkPreviewCache.set(key, preview);
+				this.linkPreviewPending.delete(key);
+				return preview;
+			})
+			.catch(() => {
+				this.linkPreviewCache.set(key, null);
+				this.linkPreviewPending.delete(key);
+				return null;
+			});
+		this.linkPreviewPending.set(key, task);
+		return task;
+	}
+
+	private async navigateToHref(href: string): Promise<void> {
+		if (!this.book) return;
+		this.savePosition();
+		const [rawPath, fragment] = href.split("#", 2);
+		const currentItem = this.book.spine[this.spineIndex];
+		const currentDir = currentItem?.href.includes("/")
+			? currentItem.href.substring(0, currentItem.href.lastIndexOf("/") + 1)
+			: "";
+		const resolved = rawPath ? resolveRelativePath(currentDir + rawPath) : currentItem?.href ?? "";
+		const targetSpine = this.book.spine.findIndex((s) => s.href === resolved);
+		if (targetSpine < 0) return;
+		await this.jumpToSpine(targetSpine, fragment ?? null);
+	}
+
+	private async navigateToTocHref(href: string): Promise<void> {
+		if (!this.book) return;
+		this.savePosition();
+		const [path, fragment] = href.split("#", 2);
+		const targetSpine = this.book.spine.findIndex((s) => s.href === path);
+		if (targetSpine < 0) return;
+		await this.jumpToSpine(targetSpine, fragment ?? null);
+	}
+
+	private async jumpToSpine(targetSpine: number, fragment: string | null): Promise<void> {
+		const sectionIdx = this.sectionIndexBySpine[targetSpine] ?? 0;
+		const section = this.sections[sectionIdx];
+		if (!section) return;
+		const targetUnitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const spreadOffset = this.getSpreadOffsetInUnitBySectionId(this.units[targetUnitIdx], section.id);
+		await this.mountCurrentUnit(targetUnitIdx, spreadOffset);
+		if (fragment) {
+			const namespacedId = `s${targetSpine}-${fragment}`;
+			const target = this.findTarget(namespacedId);
+			if (target) this.scrollToTarget(target);
+		}
+	}
+
+	private updateTocActive(): void {
+		if (!this.book) return;
+		const currentHref = this.book.spine[this.spineIndex]?.href;
+		if (!currentHref) return;
+		const allItems = Array.from(this.contentEl.querySelectorAll<HTMLElement>(".clp-toc-item"));
+		allItems.forEach((el) => el.removeClass("clp-toc-active"));
+
+		// Find the deepest ToC anchor at or before the current spread.
+		let activeSubHref: string | null = null;
+		for (let i = this.tocAnchorPageMap.length - 1; i >= 0; i--) {
+			if (this.tocAnchorPageMap[i].spreadOffset <= this.currentSpread) {
+				activeSubHref = this.tocAnchorPageMap[i].href;
+				break;
+			}
+		}
+		// Discard map hit if it belongs to a different spine doc than what's visible.
+		if (activeSubHref && activeSubHref.split("#")[0] !== currentHref) activeSubHref = null;
+
+		let subActivated = false;
+		let level0Activated = false;
+		let firstSubEl: HTMLElement | null = null;
+		for (const el of allItems) {
+			const elHref = el.dataset.href ?? "";
+			if (elHref.split("#")[0] !== currentHref) continue;
+			if (el.dataset.level === "0") {
+				el.addClass("clp-toc-active");
+				level0Activated = true;
+			} else if (!subActivated && (!activeSubHref || elHref === activeSubHref)) {
+				el.addClass("clp-toc-active");
+				subActivated = true;
+				firstSubEl = el;
+			}
+		}
+		// Sub-item active but structural parent (level-0) lives in a different spine doc —
+		// walk backwards to the nearest preceding level-0 item and give it the card state.
+		if (subActivated && !level0Activated && firstSubEl) {
+			const idx = allItems.indexOf(firstSubEl);
+			for (let i = idx - 1; i >= 0; i--) {
+				if (allItems[i].dataset.level === "0") {
+					allItems[i].addClass("clp-toc-active");
+					break;
+				}
+			}
+		}
+	}
+
+	private buildTocAnchorPageMap(): void {
+		this.tocAnchorPageMap = [];
+		if (!this.book || !this.contentNode) return;
+		const stride = this.getNavigationStride();
+		if (stride <= 0) return;
+		const contentRect = this.contentNode.getBoundingClientRect();
+		const entries: Array<{ spreadOffset: number; href: string }> = [];
+		const walk = (items: EpubTocItem[]): void => {
+			for (const item of items) {
+				const sepIdx = item.href.indexOf("#");
+				if (sepIdx !== -1) {
+					const path = item.href.slice(0, sepIdx);
+					const hash = item.href.slice(sepIdx + 1);
+					// IDs in the rendered DOM are namespaced as `s${spineIdx}-${originalId}`
+					// (see epub.ts renderSpineRange). Resolve the spine index to build the key.
+					const spineIdx = this.book!.spine.findIndex((s) => s.href === path);
+					if (spineIdx !== -1) {
+						const target = this.findTarget(`s${spineIdx}-${hash}`);
+						if (target) {
+							const rect = target.getBoundingClientRect();
+							const spreadOffset = Math.max(0, Math.floor((rect.left - contentRect.left) / stride));
+							entries.push({ spreadOffset, href: item.href });
+						}
+					}
+				}
+				if (item.children.length > 0) walk(item.children);
+			}
+		};
+		walk(this.book.toc);
+		entries.sort((a, b) => a.spreadOffset - b.spreadOffset);
+		this.tocAnchorPageMap = entries;
+	}
+
+	private annotateItalicBlocks(container: HTMLElement): void {
+		const allBlocks = Array.from(container.querySelectorAll("p, div"));
+		const candidates = allBlocks.filter((el) => {
+			if (el.querySelector("p, div, blockquote, section, article")) return false;
+			return (el.textContent?.trim() ?? "").length > 0;
+		});
+
+		const italic = candidates.map((el) => this.isItalicElement(el as HTMLElement));
+		let i = 0;
+		while (i < candidates.length) {
+			if (!italic[i]) {
+				i++;
+				continue;
+			}
+			let end = i;
+			while (end < candidates.length && italic[end]) end++;
+			if (end - i >= 3) {
+				for (let j = i; j < end; j++) candidates[j].classList.add("clp-italic-block");
+			}
+			i = end;
+		}
+
+		for (let k = 0; k < candidates.length; k++) {
+			const el = candidates[k] as HTMLElement;
+			if (el.classList.contains("clp-italic-block")) continue;
+			// A single italic leaf block counts as verse once it spans more than
+			// one line (≥1 explicit <br>). The old ≥2 bar boxed 3-line poems but
+			// dropped 2-line couplets, which the source encodes identically —
+			// purely a line-count artifact. One <br> in an italic block is almost
+			// always verse, so this keeps couplets consistent with longer poems.
+			if (italic[k] && el.querySelectorAll("br").length >= 1) el.classList.add("clp-italic-block");
+		}
+	}
+
+	private isItalicElement(el: HTMLElement): boolean {
+		const text = el.textContent?.trim() ?? "";
+		if (!text) return false;
+		let italicLen = 0;
+		el.querySelectorAll("em, i").forEach((child) => {
+			italicLen += child.textContent?.length ?? 0;
+		});
+		return italicLen / text.length >= 0.8;
+	}
+
+	// ─── REGION: Gloss UI ────────────────────────────────────────────────────
+
+	private isGlossActive(): boolean {
+		return this.activeHighlight !== null || this.glossSurface.lookupVisible;
+	}
+
+	private quickLookupKind(text: string): QuickLookupRequest["kind"] {
+		const scope = this.plugin.settings.quickLookup.scope;
+		if (scope === "sentence") return "sentence";
+		if (scope === "word") return "word";
+		const words = text.match(/[\p{L}\p{M}\p{N}]+(?:['’-][\p{L}\p{M}\p{N}]+)*/gu) ?? [];
+		if (words.length <= 1) return "word";
+		return words.length <= 5 && !/[.!?…]/.test(text) ? "phrase" : "sentence";
+	}
+
+	private registerQuickLookupHover(spread: HTMLElement): void {
+		// Contextual lookup is deliberate now: desktop double-click and mobile
+		// long-press. Hover caused an LLM request merely by resting the pointer.
+		this.registerDomEvent(spread, "dblclick", (event: MouseEvent) => {
+			const settings = this.plugin.settings.quickLookup;
+			if (Platform.isMobile || !settings.enabled || settings.trigger !== "double-click" || this.activeHighlight || this.glossSurface.inputOpen) return;
+			const hit = this.quickLookupAtPoint(event.clientX, event.clientY);
+			if (hit && !this.glossSurface.lookupPinned) void this.glossSurface.showQuickLookup(hit.request, hit.rect, true);
+		});
+
+		let longPressPointer: number | null = null;
+		let longPressStart: { x: number; y: number } | null = null;
+		this.registerDomEvent(spread, "pointerdown", (event: PointerEvent) => {
+			const settings = this.plugin.settings.quickLookup;
+			if (!Platform.isMobile || !settings.enabled || settings.trigger !== "double-click" || event.pointerType !== "touch") return;
+			longPressStart = { x: event.clientX, y: event.clientY };
+			longPressPointer = window.setTimeout(() => {
+				longPressPointer = null;
+				const hit = this.quickLookupAtPoint(event.clientX, event.clientY);
+				if (hit && !this.glossSurface.lookupPinned) void this.glossSurface.showQuickLookup(hit.request, hit.rect, true);
+			}, Math.max(350, Math.min(1500, settings.delayMs)));
+		});
+		const cancelLongPress = (): void => {
+			if (longPressPointer !== null) window.clearTimeout(longPressPointer);
+			longPressPointer = null;
+			longPressStart = null;
+		};
+		this.registerDomEvent(spread, "pointerup", cancelLongPress);
+		this.registerDomEvent(spread, "pointercancel", cancelLongPress);
+		this.registerDomEvent(spread, "pointermove", (event: PointerEvent) => {
+			if (!longPressStart) return;
+			if (Math.hypot(event.clientX - longPressStart.x, event.clientY - longPressStart.y) > 12) cancelLongPress();
+		});
+	}
+
+	private cancelQuickLookupHover(): void {
+		if (this.hoverLookupTimer !== null) window.clearTimeout(this.hoverLookupTimer);
+		this.hoverLookupTimer = null;
+	}
+
+	private quickLookupAtPoint(x: number, y: number): { request: QuickLookupRequest; rect: DOMRect } | null {
+		const caretDocument = document as Document & {
+			caretRangeFromPoint?: (x: number, y: number) => Range | null;
+			caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+		};
+		let node: Node | null = null;
+		let offset = 0;
+		const direct = caretDocument.caretRangeFromPoint?.(x, y);
+		if (direct) {
+			node = direct.startContainer;
+			offset = direct.startOffset;
+		} else {
+			const position = caretDocument.caretPositionFromPoint?.(x, y);
+			node = position?.offsetNode ?? null;
+			offset = position?.offset ?? 0;
+		}
+		if (!(node instanceof Text) || !this.contentNode?.contains(node)) return null;
+		const parent = node.parentElement;
+		if (!parent || parent.closest(".clp-bilingual-translation")) return null;
+		const block = parent.closest<HTMLElement>("[data-para-id]");
+		if (!block) return null;
+		const raw = node.data;
+		if (!raw.trim()) return null;
+		const scope = this.plugin.settings.quickLookup.scope;
+		let start = Math.min(offset, raw.length);
+		let end = start;
+		if (scope === "sentence") {
+			while (start > 0 && !/[.!?…]/.test(raw[start - 1])) start--;
+			while (end < raw.length && !/[.!?…]/.test(raw[end])) end++;
+			if (end < raw.length) end++;
+		} else {
+			const isWord = (char: string) => /[\p{L}\p{M}\p{N}'’-]/u.test(char);
+			while (start > 0 && isWord(raw[start - 1])) start--;
+			while (end < raw.length && isWord(raw[end])) end++;
+		}
+		const text = raw.slice(start, end).normalize("NFKC").replace(/\s+/g, " ").trim();
+		if (!text || text.length > 500) return null;
+		const range = document.createRange();
+		range.setStart(node, start);
+		range.setEnd(node, end);
+		const rect = range.getBoundingClientRect();
+		if (!rect.width && !rect.height) return null;
+		const context = (block.textContent ?? text).normalize("NFKC").replace(/\s+/g, " ").trim();
+		return { request: { text, context, kind: this.quickLookupKind(text) }, rect };
+	}
+
+	openQuickLookupForSelection(): void {
+		const request = this.selectionQuickLookupRequest();
+		if (!request || !this.activeSelectionRect) return;
+		void this.glossSurface.showQuickLookup(request, this.activeSelectionRect, true, true);
+	}
+
+	/** The gloss mode a numeric shortcut (1–5) maps to right now, or null if the
+	 *  shortcut isn't currently actionable: the GlossBar is hidden, a mode input
+	 *  panel is open (the number belongs to that field), or the mode is suppressed
+	 *  in Lite mode. Mirrors the GlossBar tile order. Used by the gloss commands'
+	 *  checkCallback so `1`–`5` only fire over a live selection. */
+	glossShortcutMode(slot: number): string | null {
+		return this.glossSurface.shortcutMode(slot);
+	}
+
+	/** Flip 3C mode on/off. Shared by the TOC footer button and the
+	 *  "Toggle 3C mode" command. Snaps the 3C theme to Obsidian's current colour
+	 *  scheme when turning on so the user needn't switch manually after. */
+	async toggleClpMode(): Promise<void> {
+		const newMode = this.plugin.settings.clpMode === "3c" ? "obsidian" : "3c";
+		this.plugin.settings.clpMode = newMode;
+		if (newMode === "3c") {
+			this.plugin.settings.clpTheme = document.body.classList.contains("theme-light") ? "light" : "dark";
+		}
+		await this.plugin.saveSettings();
+	}
+
+	/** Resolve whatever is selected right now into a raised GlossBar. Reached from
+	 *  mouseup on desktop and from settled `selectionchange` on touch, hence the
+	 *  input-agnostic name. */
+	private raiseGlossForSelection(): void {
+		const sel = window.getSelection();
+		// A click while extending sets the far endpoint of the anchored range.
+		if (this.isExtending) {
+			if (sel) this.finishExtend(sel);
+			return;
+		}
+		if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+		const range = sel.getRangeAt(0);
+		if (!this.spreadEl || !this.spreadEl.contains(range.startContainer)) return;
+		this.finalizeSelection(sel, range.getBoundingClientRect());
+	}
+
+	/** Resolve a native selection to a stored `CursorRange`, paint the active
+	 *  overlay, and raise the GlossBar at `anchorRect`. Shared by the ordinary
+	 *  selection path (mouseup / settled `selectionchange`) and the anchored
+	 *  cross-page extend. `anchorRect` is ignored when the bar docks. */
+	private finalizeSelection(sel: Selection, anchorRect: DOMRect): void {
+		const cursorRange = this.offsetMap.selectionToCursors(sel);
+		if (!cursorRange) return;
+		this.clearHighlightOverlay();
+		this.activeHighlight = cursorRange;
+		this.activeSelectionText = sel.toString();
+		this.activeSelectionRect = anchorRect;
+		this.renderHighlightOverlay(cursorRange);
+		this.glossSurface.hideInput();
+		this.glossSurface.hideLookup();
+		this.glossSurface.showBar(anchorRect, this.selectionReachesSpreadEnd(sel));
+	}
+
+	/** True when the selection ends on the last visible line of the spread —
+	 *  i.e. the next run of text flows onto a further spread in this unit. This
+	 *  is the only case where "Extend across pages" is useful, so the tile is
+	 *  gated on it to keep the bar uncluttered during normal selection. Column-
+	 *  count-agnostic: it asks whether the following text is off the visible
+	 *  viewport, which holds for both single- and two-page layouts. */
+	private selectionReachesSpreadEnd(sel: Selection): boolean {
+		if (!this.spreadEl || !this.contentNode || sel.rangeCount === 0) return false;
+		const next = this.rectAfterSelectionEnd(sel.getRangeAt(0));
+		// No following text in this unit → nothing to extend into.
+		if (!next) return false;
+
+		// Compare against the usable reading box, not spreadEl's outer rect: the
+		// spread carries large side padding, and in two-page view the next
+		// spread's column begins *inside* that right padding (just past the
+		// visible columns). Comparing to the padded edge — plus a margin from the
+		// column gap so a glyph at the rightmost column's own edge can't trigger —
+		// is what makes this work in both single- and two-page layouts.
+		const view = this.spreadEl.getBoundingClientRect();
+		const sCs = getComputedStyle(this.spreadEl);
+		const padR = parseFloat(sCs.paddingRight) || 0;
+		const padB = parseFloat(sCs.paddingBottom) || 0;
+		const gap = parseFloat(getComputedStyle(this.contentNode).columnGap) || 0;
+		const margin = Math.max(8, gap / 2);
+		const rightEdge = view.right - padR;
+		const bottomEdge = view.bottom - padB;
+
+		// Following text sits in a further column (past the visible reading area)
+		// or below the visible bottom → the selection reached the page's last line.
+		return next.left >= rightEdge + margin || next.top >= bottomEdge;
+	}
+
+	/** Bounding rect of the position immediately after a range's end: the next
+	 *  character in the same text node, else the first character of the next
+	 *  non-empty text node in document order within the content. Null at the end
+	 *  of the unit's content. */
+	private rectAfterSelectionEnd(range: Range): DOMRect | null {
+		const node = range.endContainer;
+		const offset = range.endOffset;
+		const probe = document.createRange();
+		if (node.nodeType === Node.TEXT_NODE && offset < (node.textContent?.length ?? 0)) {
+			probe.setStart(node, offset);
+			probe.setEnd(node, offset + 1);
+			const r = probe.getBoundingClientRect();
+			if (r.width || r.height) return r;
+		}
+		const nextNode = this.nextTextNode(node);
+		if (!nextNode) return null;
+		probe.setStart(nextNode, 0);
+		probe.setEnd(nextNode, Math.min(1, nextNode.textContent?.length ?? 0));
+		const r = probe.getBoundingClientRect();
+		return r.width || r.height ? r : null;
+	}
+
+	/** Next non-whitespace text node after `from` in document order, scoped to
+	 *  the content node. */
+	private nextTextNode(from: Node): Text | null {
+		const root = this.contentNode;
+		if (!root || !root.contains(from)) return null;
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+		walker.currentNode = from;
+		let n = walker.nextNode();
+		while (n) {
+			// Skip descendants of `from`: when the selection ends on an element
+			// boundary, the walker would otherwise dive back into the just-
+			// selected text and report an on-screen rect.
+			if (!from.contains(n) && (n.textContent?.trim().length ?? 0) > 0) return n as Text;
+			n = walker.nextNode();
+		}
+		return null;
+	}
+
+	/** Arm anchored cross-page selection: freeze the current selection's start
+	 *  as the anchor, keep the selection alive, hide the bar, and surface a hint.
+	 *  The next reader click (`finishExtend`) sets the far endpoint. */
+	private beginExtend(): void {
+		const sel = window.getSelection();
+		if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+		const range = sel.getRangeAt(0);
+		if (!this.spreadEl?.contains(range.startContainer)) return;
+		this.extendAnchor = { node: range.startContainer, offset: range.startOffset };
+		this.isExtending = true;
+		this.glossSurface.hideBar();
+		this.showExtendHint();
+	}
+
+	/** Complete an anchored selection: span from the frozen anchor to the just-
+	 *  clicked point (ordered into document order), then run the standard
+	 *  finalize pipeline. Aborts cleanly if either boundary has left the DOM
+	 *  (e.g. the reader crossed a unit boundary or relayed out mid-gesture). */
+	private finishExtend(sel: Selection): void {
+		const anchor = this.extendAnchor;
+		this.isExtending = false;
+		this.extendAnchor = null;
+		this.hideExtendHint();
+		if (!anchor || sel.rangeCount === 0) return;
+
+		const endRange = sel.getRangeAt(0);
+		const endNode = endRange.endContainer;
+		const endOffset = endRange.endOffset;
+		const sp = this.spreadEl;
+		if (!sp || !sp.contains(anchor.node) || !sp.contains(endNode)) return;
+
+		// Order the two boundary points so setStart/setEnd never go backwards.
+		const probe = document.createRange();
+		probe.setStart(anchor.node, anchor.offset);
+		probe.setEnd(anchor.node, anchor.offset);
+		let rel: number;
+		try { rel = probe.comparePoint(endNode, endOffset); } catch { return; }
+
+		const full = document.createRange();
+		try {
+			if (rel >= 0) {
+				full.setStart(anchor.node, anchor.offset);
+				full.setEnd(endNode, endOffset);
+			} else {
+				full.setStart(endNode, endOffset);
+				full.setEnd(anchor.node, anchor.offset);
+			}
+		} catch { return; }
+		if (full.collapsed) return;
+
+		// Position the bar at the click (the visible endpoint); the full range's
+		// own rect would reach off-screen onto the anchor's page.
+		const clickRect = endRange.getBoundingClientRect();
+		const rect = clickRect.width || clickRect.height || clickRect.top || clickRect.left
+			? clickRect
+			: full.getBoundingClientRect();
+
+		sel.removeAllRanges();
+		sel.addRange(full);
+		this.finalizeSelection(sel, rect);
+	}
+
+	private ensureExtendHint(): HTMLElement {
+		if (this.extendHintEl) return this.extendHintEl;
+		const el = document.body.createEl("div", {
+			cls: "clp-extend-hint clp-hidden",
+			text: "Turn the page, then click where the highlight should end · Esc to cancel",
+		});
+		applyGlossTheme(el, this.plugin.settings);
+		this.extendHintEl = el;
+		return el;
+	}
+
+	private showExtendHint(): void {
+		this.ensureExtendHint().removeClass("clp-hidden");
+	}
+
+	private hideExtendHint(): void {
+		this.extendHintEl?.addClass("clp-hidden");
+	}
+
+	openGlossInput(modeId: string): void {
+		if (!this.activeHighlight || !this.activeSelectionRect) return;
+		this.glossSurface.openInput(modeId, this.activeSelectionRect);
+	}
+
+	/** A gloss tile was submitted. `text` is already trimmed and validated by the
+	 *  surface (only Emphasise may be empty). */
+	private async onGlossSubmit(mode: string, userText: string): Promise<void> {
+		const highlight = this.activeHighlight;
+		if (!highlight) return;
+		const quote = this.activeSelectionText ?? "";
+		try {
+			await this.persistGloss(mode, userText, quote, highlight);
+		} catch (err) {
+			console.error("persistGloss failed", err);
+			new Notice("Comprehensible Learning Portal: failed to save annotation");
+			return;
+		}
+		// All AI modes open the Conversations tab immediately on submit so
+		// the user lands in the chat surface without manual navigation, then the
+		// initial AI call is fired into the now-open chat's live log so the first
+		// turn streams token-by-token like every follow-up.
+		if (GLOSS_AI_MODES.has(mode)) {
+			if (!this.pane.isOpen) this.pane.toggle();
+			this.pane.setTab("conversations");
+			const idx = this.savedHighlights.length - 1;
+			this.pane.openConversation(idx);
+			const saved = this.savedHighlights[idx];
+			if (saved) this.pane.runInitialExchange(saved);
+		}
+		this.dismissGloss();
+	}
+
+	private async persistGloss(
+		modeId: string,
+		userText: string,
+		quote: string,
+		highlight: CursorRange,
+	): Promise<void> {
+		const path = this.getCompanionDocPath();
+		if (!path) return;
+		const callout = this.buildCallout(modeId, userText, quote, highlight);
+		const file = await ensureCompanionDoc(
+			this.app,
+			path,
+			this.book?.title ?? this.currentFile?.basename ?? "Book",
+			this.currentFile ? `[[${this.currentFile.path}]]` : "",
+		);
+		if (!file) return;
+		await appendCallout(this.app, file, callout);
+
+		const chars = this.offsetMap.cursorRangeToChars(highlight);
+		const entry = this.offsetMap.get(highlight.paraId);
+		const prefix = entry ? entry.text.replace(/\s+/g, " ").trim().slice(0, ANCHOR_PREFIX_LEN) : "";
+		// Synthesise the in-memory record so the freshly saved highlight is
+		// renderable without a re-parse. AI-bearing modes get a `pending`
+		// state because `buildCallout` writes the pending marker for them.
+		const isAiMode = GLOSS_AI_MODES.has(modeId);
+		this.savedHighlights.push({
+			mode: modeId,
+			paraIdHint: highlight.paraId,
+			endParaIdHint: highlight.endParaId,
+			startChar: chars?.startChar ?? -1,
+			endChar: chars?.endChar ?? -1,
+			prefix,
+			userText,
+			quote,
+			turns: [],
+			aiState: isAiMode ? "pending" : "complete",
+		});
+		this.renderSavedHighlights();
+		if (isAiMode) void this.pane.syncAiPendingFlag();
+		new Notice(`${modeId[0].toUpperCase()}${modeId.slice(1)} saved`);
+		// The initial AI call for AI-bearing modes is fired by `onGlossSubmit`
+		// once the Conversations card is open, so the first turn streams into the
+		// live log just like every follow-up turn.
+	}
+
+	/** Parse the companion doc on book load so prior-session highlights are
+	 *  re-rendered in the reader. Missing file = empty list (silent). */
+	private async loadSavedHighlights(): Promise<void> {
+		this.savedHighlights = [];
+		const path = this.getCompanionDocPath();
+		if (!path) return;
+		try {
+			const file = this.app.vault.getFileByPath(path);
+			if (!file) return;
+			const content = await this.app.vault.cachedRead(file);
+			this.savedHighlights = parseSavedHighlights(content);
+		} catch (err) {
+			console.error("[ComprehensibleLearningPortal] loadSavedHighlights failed", err);
+		} finally {
+			// Companion-doc existence is now resolved for this book — sync the
+			// note button (it may not exist yet for a never-annotated book).
+			this.pane.refreshCompanionDocButton();
+		}
+	}
+
+	// ─── Bookmarks ───────────────────────────────────────────────────────────
+	/** Opening text of the anchored paragraph, stored as the callout's quote.
+	 *  Long enough to recognise the passage in the Annotations list, short
+	 *  enough not to dump a paragraph into the companion doc. */
+	private static readonly BOOKMARK_QUOTE_LEN = 180;
+
+	/** The paragraph the current spread opens on — what a bookmark anchors to.
+	 *
+	 *  The inverse of `scrollToTarget`, which turns an element into a spread
+	 *  index the same way. One pass handles both cases: a paragraph spanning two
+	 *  spreads reports the union of its fragments, so its `left` sits on the
+	 *  *earlier* one, and a page made entirely of such a tail would match
+	 *  nothing. Keeping the last paragraph at or before the current spread lands
+	 *  on the one the page's first line actually belongs to either way. */
+	private firstParaIdOnSpread(): string | null {
+		if (!this.contentNode) return null;
+		if (this.isContinuousFlow() && this.spreadEl) {
+			const top = this.spreadEl.getBoundingClientRect().top + 8;
+			for (const el of Array.from(this.contentNode.querySelectorAll<HTMLElement>("[data-para-id]"))) {
+				if (el.getBoundingClientRect().bottom >= top) return el.dataset.paraId ?? null;
+			}
+			return null;
+		}
+		const stride = this.getNavigationStride();
+		if (stride <= 0) return null;
+		const contentLeft = this.contentNode.getBoundingClientRect().left;
+		let fallback: string | null = null;
+		for (const el of Array.from(this.contentNode.querySelectorAll<HTMLElement>("[data-para-id]"))) {
+			const spread = Math.floor((el.getBoundingClientRect().left - contentLeft) / stride);
+			// Document order means offsets only increase — nothing later can match.
+			if (spread > this.currentSpread) break;
+			if (spread === this.currentSpread) return el.dataset.paraId ?? null;
+			fallback = el.dataset.paraId ?? fallback;
+		}
+		return fallback;
+	}
+
+	/** Every spread an element's rendered fragments land on — two, for a
+	 *  paragraph that splits across the column boundary.
+	 *
+	 *  `getBoundingClientRect` cannot answer this: it returns the *union* of the
+	 *  fragments, so its `left` is always the earlier spread. Exact only while
+	 *  `break-inside: avoid-column` keeps paragraphs atomic — once they may
+	 *  fragment, a page made entirely of continuation text anchors its bookmark
+	 *  to the page before it, and no tap on that page can clear it.
+	 *
+	 *  Range rects are per line box, so this sees each fragment separately. */
+	private spreadsForElement(el: HTMLElement, contentLeft: number, stride: number): Set<number> {
+		const spreads = new Set<number>();
+		const range = document.createRange();
+		range.selectNodeContents(el);
+		for (const rect of Array.from(range.getClientRects())) {
+			if (rect.width <= 0 && rect.height <= 0) continue;
+			spreads.add(Math.floor((rect.left - contentLeft) / stride));
+		}
+		// Nothing rendered (empty paragraph, or an element the range can't
+		// measure) — fall back to the union so it still maps somewhere rather
+		// than dropping out of bookmark detection entirely.
+		if (spreads.size === 0) {
+			spreads.add(Math.floor((el.getBoundingClientRect().left - contentLeft) / stride));
+		}
+		return spreads;
+	}
+
+	/** Index of a bookmark whose paragraph is visible on the current spread, or
+	 *  -1. Deliberately "visible on", not "anchors the page": it is what lights
+	 *  the button up when you arrive at a bookmarked page from either
+	 *  direction, and what stops a page collecting a second bookmark when a
+	 *  reflow moves which paragraph opens it. */
+	private bookmarkIndexOnSpread(): number {
+		if (!this.contentNode) return -1;
+		if (this.isContinuousFlow() && this.spreadEl) {
+			const viewport = this.spreadEl.getBoundingClientRect();
+			for (let idx = 0; idx < this.savedHighlights.length; idx++) {
+				const saved = this.savedHighlights[idx];
+				if (saved.mode !== BOOKMARK_MODE.id) continue;
+				const resolvedId = saved.prefix
+					? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
+					: saved.paraIdHint;
+				const entry = resolvedId ? this.offsetMap.get(resolvedId) : null;
+				if (!entry || !this.contentNode.contains(entry.element)) continue;
+				const rect = entry.element.getBoundingClientRect();
+				if (rect.bottom >= viewport.top && rect.top <= viewport.bottom) return idx;
+			}
+			return -1;
+		}
+		const stride = this.getNavigationStride();
+		if (stride <= 0) return -1;
+		const contentLeft = this.contentNode.getBoundingClientRect().left;
+		for (let idx = 0; idx < this.savedHighlights.length; idx++) {
+			const saved = this.savedHighlights[idx];
+			if (saved.mode !== BOOKMARK_MODE.id) continue;
+			const resolvedId = saved.prefix
+				? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
+				: saved.paraIdHint;
+			if (!resolvedId) continue;
+			const entry = this.offsetMap.get(resolvedId);
+			// The offsetMap holds adjacent units too, so presence isn't presence
+			// on screen — same check the overlay painter makes.
+			if (!entry || !this.contentNode.contains(entry.element)) continue;
+			if (this.spreadsForElement(entry.element, contentLeft, stride).has(this.currentSpread)) return idx;
+		}
+		return -1;
+	}
+
+	/** Sync the chrome button with whether this page carries a bookmark. Driven
+	 *  from `renderSavedHighlights`, which already runs after every mount and
+	 *  every persist — the two things that can change the answer. */
+	private updateBookmarkButton(): void {
+		const marked = this.bookmarkIndexOnSpread() !== -1;
+		// Set before the early return: on a phone the caption carries this state
+		// with the chrome down, when the button itself is not on screen.
+		this.spreadBookmarked = marked;
+		const el = this.bookmarkToggleEl;
+		if (!el) return;
+		el.toggleClass("clp-bookmark-active", marked);
+		el.ariaLabel = marked ? "Remove bookmark" : "Bookmark this page";
+	}
+
+	/** Set or clear a bookmark on the current page. */
+	async toggleBookmark(): Promise<void> {
+		if (!this.book) return;
+		const existing = this.bookmarkIndexOnSpread();
+		if (existing !== -1) {
+			// No confirmation: the same button that made it unmakes it.
+			await this.pane.deleteHighlightAt(existing, false);
+			this.updateBookmarkButton();
+			this.renderMobilePages();
+			return;
+		}
+
+		const paraId = this.firstParaIdOnSpread();
+		if (!paraId) {
+			new Notice("Comprehensible Learning Portal: nothing on this page to bookmark");
+			return;
+		}
+		const built = this.buildBookmarkCallout(paraId);
+		if (!built) return;
+
+		const path = this.getCompanionDocPath();
+		if (!path) return;
+		const file = await ensureCompanionDoc(
+			this.app,
+			path,
+			this.book.title || this.currentFile?.basename || "Book",
+			this.currentFile ? `[[${this.currentFile.path}]]` : "",
+		);
+		if (!file) return;
+		await appendCallout(this.app, file, built.callout);
+
+		// Synthesise the in-memory record so the pane and the button update
+		// without a re-parse. -1 offsets are the rangeless marker.
+		this.savedHighlights.push({
+			mode: BOOKMARK_MODE.id,
+			paraIdHint: paraId,
+			startChar: -1,
+			endChar: -1,
+			prefix: built.prefix,
+			userText: "",
+			quote: built.quote,
+			turns: [],
+			aiState: "complete",
+		});
+		this.renderSavedHighlights();
+		// The caption only redraws on navigation otherwise, and setting a
+		// bookmark is the one thing that changes it while standing still.
+		this.renderMobilePages();
+		this.pane.renderActivePane();
+		// No Notice: the button's active state (and the phone caption's glyph)
+		// already say it happened, and on a phone the toast lands over the
+		// toolbar it is reporting on.
+	}
+
+	/** The callout for a bookmark: an anchor with no `chars:` field, and the
+	 *  anchored paragraph's opening as the quote. Nothing was selected, so that
+	 *  quote is context rather than a quotation — but it is the only thing that
+	 *  identifies the page in the Annotations list, and it keeps the companion
+	 *  doc readable on its own. */
+	private buildBookmarkCallout(
+		paraId: string,
+	): { callout: string; prefix: string; quote: string } | null {
+		const match = /^s(\d+)-p(\d+)$/.exec(paraId);
+		if (!match) return null;
+		const spineIdx = parseInt(match[1], 10);
+		const paraIdx = parseInt(match[2], 10);
+		const sectionLabel = this.sections[this.sectionIndexBySpine[spineIdx] ?? 0]?.label ?? "";
+		const entry = this.offsetMap.get(paraId);
+		const text = entry ? entry.text.replace(/\s+/g, " ").trim() : "";
+		const prefix = text.slice(0, ANCHOR_PREFIX_LEN);
+		const max = ReaderView.BOOKMARK_QUOTE_LEN;
+		const quote = text.length > max ? text.slice(0, max).trimEnd() + "…" : text;
+		const anchor =
+			`<!-- clp-anchor spine:${spineIdx} para:${paraId} ` +
+			`prefix:"${encodeURIComponent(prefix)}" -->`;
+		return {
+			callout: buildCallout({
+				modeId: BOOKMARK_MODE.id,
+				header: calloutHeader(quote, sectionLabel, `¶${paraIdx}`),
+				anchor,
+				quote,
+				userText: "",
+			}),
+			prefix,
+			quote,
+		};
+	}
+
+	/** Re-read the companion doc and repaint everything that renders from it.
+	 *  Used after the queue processor rewrites callouts underneath a book that
+	 *  is already open. */
+	async reloadAnnotations(): Promise<void> {
+		await this.loadSavedHighlights();
+		this.renderSavedHighlights();
+		this.pane.renderActivePane();
+	}
+
+	/** Answer any exchanges this book's companion doc has queued (Mobile spec,
+	 *  Tier 1 — "auto on book open").
+	 *
+	 *  Fires after the companion parse, which has already resolved `aiState`, so
+	 *  the check costs nothing when there is nothing queued — the overwhelmingly
+	 *  common case. Silent by design: no provider, no queue, or a failure all
+	 *  leave the reader exactly as it was, and a failed exchange keeps its error
+	 *  marker for the pane to show. The palette command is the loud path. */
+	private async processQueuedExchanges(): Promise<void> {
+		if (Platform.isMobile) return;
+		if (!this.savedHighlights.some((h) => h.aiState === "pending")) return;
+		const path = this.getCompanionDocPath();
+		const file = path ? this.app.vault.getFileByPath(path) : null;
+		const provider = this.plugin.activeAiProvider();
+		if (!file || !provider) return;
+		try {
+			const res = await processPendingInFile(this.app, file, this.plugin.settings, provider);
+			if (res.resolved || res.failed) await this.reloadAnnotations();
+		} catch (err) {
+			console.error("[ComprehensibleLearningPortal] processQueuedExchanges failed", err);
+		}
+	}
+
+	// ─── REGION: Highlights & Annotations ───────────────────────────────────
+	/** Paint all saved highlights that land inside the currently-mounted unit.
+	 *  Called after every mount (DOM gets wiped by `contentNode.empty()`, so we
+	 *  rebuild the overlay from scratch) and after a successful persist. */
+	/** The highlight's own client rects — one per line box — in the live DOM.
+	 *  Empty when it has no geometry to speak of: a bookmark (anchored to a
+	 *  paragraph, selecting nothing), a legacy anchor with -1 char offsets, or a
+	 *  selection whose end paragraph isn't in this unit.
+	 *
+	 *  Shared by the overlay painter and the pane's jump so "where is this
+	 *  highlight" has exactly one answer. The *paragraph* element can't serve:
+	 *  its bounding rect is the union of its fragments, so a highlight in a
+	 *  paragraph's tail would land one page early. */
+	private savedHighlightRects(saved: SavedHighlight, resolvedId: string): DOMRect[] {
+		if (saved.mode === BOOKMARK_MODE.id) return [];
+		if (saved.startChar < 0 || saved.endChar < 0) return [];
+		const entry = this.offsetMap.get(resolvedId);
+		if (!entry || !this.contentNode?.contains(entry.element)) return [];
+		// Cross-paragraph selections need their end paragraph in this unit too;
+		// a cross-unit one has nothing to measure.
+		const endParaId = saved.endParaIdHint;
+		if (endParaId && endParaId !== resolvedId) {
+			const endEntry = this.offsetMap.get(endParaId);
+			if (!endEntry || !this.contentNode.contains(endEntry.element)) return [];
+		}
+		return this.rectsForCharRange(resolvedId, saved.startChar, saved.endChar, endParaId);
+	}
+
+	/** Client rects — one per line box — for a character range in a paragraph.
+	 *  The single place the offset model becomes geometry: the saved-highlight
+	 *  overlay, the search-match flash and both jumps read it, so "where is this
+	 *  text on screen" has one answer rather than three copies that can drift. */
+	private rectsForCharRange(paraId: string, start: number, end: number, endParaId?: string): DOMRect[] {
+		const cursorRange = this.offsetMap.charRangeToCursorRange(paraId, start, end, endParaId);
+		if (!cursorRange) return [];
+		const rects: DOMRect[] = [];
+		for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
+			for (const r of Array.from(range.getClientRects())) {
+				if (r.width > 0 && r.height > 0) rects.push(r);
+			}
+		}
+		return rects;
+	}
+
+	private renderSavedHighlights(): void {
+		// Runs on every unit mount + after each annotation submit, so it's the
+		// natural place to refresh the note button once the first save creates
+		// the companion doc.
+		this.pane.refreshCompanionDocButton();
+		if (!this.contentNode) return;
+		// Covers the persist case — a bookmark added or removed without any
+		// navigation. Page turns are handled by `updateProgress`, which is the
+		// one thing that runs on a spread change *within* a mounted unit; this
+		// method does not (the overlay rides the translateX transform, so it
+		// has nothing to repaint until the unit changes).
+		this.updateBookmarkButton();
+		this.contentNode.querySelectorAll(".clp-saved-highlight-overlay").forEach((n) => n.remove());
+		if (this.savedHighlights.length === 0) return;
+
+		const overlay = document.createElement("div");
+		overlay.className = "clp-saved-highlight-overlay";
+		const contentRect = this.contentNode.getBoundingClientRect();
+
+		for (let idx = 0; idx < this.savedHighlights.length; idx++) {
+			const saved = this.savedHighlights[idx];
+			// Bookmarks anchor to a paragraph but select no text, so there is
+			// nothing to paint. Explicit rather than relying on the -1 char
+			// offsets to fall through — that path happens to no-op today, and
+			// a stray rect is exactly the kind of bug that ships silently.
+			if (saved.mode === BOOKMARK_MODE.id) continue;
+			// Resolve paraId via prefix — recovers from paragraph-index drift
+			// if the source epub's paragraph count shifts (split/merge). Falls
+			// back to the hint when no prefix is stored (legacy anchors).
+			const resolvedId = saved.prefix
+				? this.offsetMap.findParaIdByPrefix(saved.prefix, saved.paraIdHint)
+				: saved.paraIdHint;
+			if (!resolvedId) continue;
+			const entry = this.offsetMap.get(resolvedId);
+			// Only render if the paragraph lives in the *current* unit's DOM —
+			// prepareUnit populates paraIds for adjacent units too, so presence in
+			// the offsetMap alone doesn't mean the paragraph is on screen.
+			if (!entry || !this.contentNode.contains(entry.element)) continue;
+
+			for (const r of this.savedHighlightRects(saved, resolvedId)) {
+				const rectEl = document.createElement("div");
+				rectEl.className = "clp-saved-highlight-rect";
+				if (idx === this.pane.activeConversationIdx) {
+					rectEl.classList.add("clp-saved-highlight-rect-active");
+				}
+				rectEl.dataset.mode = saved.mode;
+				rectEl.dataset.highlightIdx = String(idx);
+				rectEl.style.left = `${r.left - contentRect.left}px`;
+				rectEl.style.top = `${r.top - contentRect.top}px`;
+				rectEl.style.width = `${r.width}px`;
+				rectEl.style.height = `${r.height}px`;
+				overlay.appendChild(rectEl);
+			}
+		}
+		this.contentNode.appendChild(overlay);
+	}
+
+	/** Hit-test the pointer against rendered highlight rects. On enter, surface
+	 *  a body-scoped preview with the annotation's user text; on exit, hide it.
+	 *  The shared preview tracks its own index so the DOM isn't rebuilt as the
+	 *  pointer moves across rects belonging to the same highlight. */
+	private handleAnnotationHover(e: MouseEvent): void {
+		// Footnote refs, citations and links summon their own floater via the
+		// spread's mouseover handler — give that one priority instead of
+		// stacking the annotation preview beneath it (both fire when the ref
+		// sits inside a saved highlight's rect).
+		const hoverEl = e.target instanceof Element ? e.target : null;
+		const overlay = this.contentNode?.querySelector(".clp-saved-highlight-overlay");
+		if (
+			hoverEl?.closest(".clp-citation, a[href], [data-rid]") ||
+			!overlay ||
+			this.savedHighlights.length === 0
+		) {
+			this.hideAnnotationPreview();
+			return;
+		}
+
+		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
+		const saved = matchedIdx === -1 ? null : this.savedHighlights[matchedIdx];
+		if (!saved) {
+			this.hideAnnotationPreview();
+			return;
+		}
+		this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
+	}
+
+	/** Hit-test the click against rendered highlight rects. If the pointer
+	 *  lands on a rect for an AI-bearing highlight, open the Conversations
+	 *  tab and expand its card; returns true so the caller can stop other
+	 *  handlers (anchor navigation etc.) from firing. Non-AI highlights and
+	 *  empty hits return false. */
+	private handleHighlightClick(e: MouseEvent): boolean {
+		if (!this.contentNode || this.savedHighlights.length === 0) return false;
+		const overlay = this.contentNode.querySelector(".clp-saved-highlight-overlay");
+		if (!overlay) return false;
+
+		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
+		if (matchedIdx === -1) return false;
+
+		const saved = this.savedHighlights[matchedIdx];
+		if (!saved) return false;
+
+		// Touch has no hover, so the preview desktop gets for free needs a tap of
+		// its own — and that tap is the whole interaction here. Opening the
+		// Conversations pane straight from the first tap would hijack the read
+		// every time a thumb landed on an old highlight, so the pane is behind a
+		// second tap *on the preview*. Emphasise highlights, which have no click
+		// behaviour at all on desktop, get the preview too: it's the only way to
+		// read their note on a phone.
+		if (Platform.isMobile) {
+			this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
+			return true;
+		}
+
+		return this.openConversationForHighlight(matchedIdx, saved);
+	}
+
+	/** Second half of the touch two-step: the reader tapped the preview itself.
+	 *  The preview is body-scoped, so this is reached from a document listener
+	 *  rather than the spread's own click handler. */
+	private openConversationFromPreview(): void {
+		const idx = this.annotationPreview.hoveredIdx;
+		const saved = idx === -1 ? null : this.savedHighlights[idx];
+		this.hideAnnotationPreview();
+		if (saved) this.openConversationForHighlight(idx, saved);
+	}
+
+	/** Raise the Conversations tab on a saved highlight, if it has anything to
+	 *  show. False means "nothing to open" — a plain Emphasise, or a bare-flagged
+	 *  callout the pane is currently filtering out (Exclaim/Enquiry with no prompt
+	 *  and no AI turn only list when that quick-setting is on, so expanding one
+	 *  would scroll to a card that isn't there). */
+	private openConversationForHighlight(idx: number, saved: SavedHighlight): boolean {
+		if (!GLOSS_AI_MODES.has(saved.mode)) return false;
+		if (this.pane.isBareFlagged(saved) && !this.plugin.settings.showBareFlaggedConversations) {
+			return false;
+		}
+		if (!this.pane.isOpen) this.pane.toggle();
+		this.pane.setTab("conversations");
+		this.pane.openConversation(idx);
+		return true;
+	}
+
+	private hideAnnotationPreview(): void {
+		if (this.annotationPreview.hoveredIdx !== -1) this.annotationPreview.hide();
+	}
+
+	private getCompanionDocPath(): string | null {
+		if (!this.book && !this.currentFile) return null;
+		return companionDocPath(this.book?.title || this.currentFile?.basename || "Book");
+	}
+
+	private buildCallout(
+		modeId: string,
+		userText: string,
+		quote: string,
+		highlight: CursorRange,
+	): string {
+		const match = /^s(\d+)-p(\d+)$/.exec(highlight.paraId);
+		const spineIdx = match ? parseInt(match[1], 10) : 0;
+		const paraIdx = match ? parseInt(match[2], 10) : 0;
+		const sectionIdx = this.sectionIndexBySpine[spineIdx] ?? 0;
+		const sectionLabel = this.sections[sectionIdx]?.label ?? "";
+
+		const header = calloutHeader(quote, sectionLabel, `¶${paraIdx}`);
+
+		// CFI-style anchor: absolute char offsets within the paragraph's text
+		// (segment-agnostic) + a URL-encoded text prefix for drift recovery.
+		// Legacy cursor fields dropped — parser still handles old format.
+		const chars = this.offsetMap.cursorRangeToChars(highlight);
+		const entry = this.offsetMap.get(highlight.paraId);
+		const prefixRaw = entry ? entry.text.replace(/\s+/g, " ").trim().slice(0, ANCHOR_PREFIX_LEN) : "";
+		const prefix = encodeURIComponent(prefixRaw);
+		let anchor: string;
+		if (!chars) {
+			anchor = `<!-- clp-anchor spine:${spineIdx} para:${highlight.paraId} prefix:"${prefix}" -->`;
+		} else if (highlight.endParaId) {
+			// Cross-paragraph: endChars holds the end offset within endParaId.
+			// chars:S,-1 is a sentinel so old plugin versions skip this anchor cleanly.
+			anchor =
+				`<!-- clp-anchor spine:${spineIdx} para:${highlight.paraId} ` +
+				`chars:${chars.startChar},-1 endPara:"${highlight.endParaId}" ` +
+				`endChars:${chars.endChar} prefix:"${prefix}" -->`;
+		} else {
+			anchor =
+				`<!-- clp-anchor spine:${spineIdx} para:${highlight.paraId} ` +
+				`chars:${chars.startChar},${chars.endChar} prefix:"${prefix}" -->`;
+		}
+
+		return buildCallout({ modeId, header, anchor, quote, userText });
+	}
+
+	private renderHighlightOverlay(cursorRange: CursorRange): void {
+		if (!this.contentNode) return;
+		const ranges = this.offsetMap.cursorsToRanges(cursorRange);
+		if (ranges.length === 0) return;
+
+		const overlay = document.createElement("div");
+		overlay.className = "clp-highlight-overlay";
+		const contentRect = this.contentNode.getBoundingClientRect();
+		for (const range of ranges) {
+			for (const r of Array.from(range.getClientRects())) {
+				if (r.width === 0 || r.height === 0) continue;
+				const rectEl = document.createElement("div");
+				rectEl.className = "clp-highlight-rect";
+				rectEl.style.left = `${r.left - contentRect.left}px`;
+				rectEl.style.top = `${r.top - contentRect.top}px`;
+				rectEl.style.width = `${r.width}px`;
+				rectEl.style.height = `${r.height}px`;
+				overlay.appendChild(rectEl);
+			}
+		}
+		this.contentNode.appendChild(overlay);
+		this.highlightOverlayEl = overlay;
+	}
+
+	private clearHighlightOverlay(): void {
+		this.highlightOverlayEl?.remove();
+		this.highlightOverlayEl = null;
+		this.activeHighlight = null;
+	}
+
+	private dismissGloss(): void {
+		this.cancelQuickLookupHover();
+		this.glossSurface.hide();
+		this.activeSelectionText = null;
+		this.activeSelectionRect = null;
+		// Tear down any armed extend (Escape-cancel, outside-click, or a unit
+		// boundary all route here).
+		this.isExtending = false;
+		this.extendAnchor = null;
+		this.hideExtendHint();
+		this.clearHighlightOverlay();
+		window.getSelection()?.removeAllRanges();
+		this.syncScrim();
+	}
+
+	// ── Footnote / cross-reference tooltip ─────────────────────────────────────
+
+	private ensureTooltipNode(): HTMLElement {
+		if (this.tooltipEl) return this.tooltipEl;
+		const el = document.body.createEl("div", { cls: "clp-tooltip clp-hidden" });
+		this.tooltipEl = el;
+		applyGlossTheme(el, this.plugin.settings);
+		return el;
+	}
+
+	private showTooltip(target: Element, e: MouseEvent): void {
+		// Calibre-style epubs use empty <a id="..."> bookmarks before content — step forward
+		let el: Element = target;
+		if (!el.textContent?.trim()) {
+			let sib = el.nextElementSibling;
+			while (sib && !sib.textContent?.trim()) sib = sib.nextElementSibling;
+			if (sib) el = sib;
+		}
+		const img = el.querySelector("img");
+		if (img) {
+			const caption = el.querySelector("figcaption, .caption, p");
+			this.renderTooltip(
+				{
+					kind: "image",
+					imageSrc: img.getAttribute("src") ?? undefined,
+					caption: caption?.textContent?.trim() || undefined,
+				},
+				e,
+			);
+		} else {
+			const text = (el.textContent ?? "").trim().replace(/^\d+[.)]\s*/, "");
+			if (!text) return;
+			this.renderTooltip(this.buildInlineTextPreview(text), e);
+		}
+	}
+
+	private showTooltipPreview(preview: EpubLinkPreview, e: MouseEvent): void {
+		this.renderTooltip(preview, e);
+	}
+
+	private renderTooltip(preview: EpubLinkPreview, e: MouseEvent): void {
+		const tooltip = this.ensureTooltipNode();
+		tooltip.empty();
+		if (preview.kind === "image" && preview.imageSrc) {
+			const img = createEl("img");
+			img.src = preview.imageSrc;
+			tooltip.appendChild(img);
+			if (preview.caption?.trim()) {
+				tooltip.createEl("p", { cls: "clp-tooltip-caption", text: preview.caption.trim() });
+			}
+		} else {
+			tooltip.createEl("p", {
+				cls: "clp-tooltip-text",
+				text: (preview.text ?? "").trim(),
+			});
+		}
+
+		tooltip.setCssProps({ left: "0px", top: "0px", visibility: "hidden" });
+		tooltip.removeClass("clp-hidden");
+
+		const rect = tooltip.getBoundingClientRect();
+		const safe = getSafeViewport();
+		const maxLeft = Math.max(safe.left + ReaderView.TOOLTIP_MARGIN, safe.right - rect.width - ReaderView.TOOLTIP_MARGIN);
+		const x = Math.max(
+			safe.left + ReaderView.TOOLTIP_MARGIN,
+			Math.min(e.clientX + ReaderView.TOOLTIP_OFFSET_X, maxLeft),
+		);
+		const preferredBelow = e.clientY + ReaderView.TOOLTIP_OFFSET_Y;
+		const preferredAbove = e.clientY - rect.height - 12;
+		const y = preferredBelow + rect.height <= safe.bottom - ReaderView.TOOLTIP_MARGIN
+			? preferredBelow
+			: Math.max(
+				safe.top + ReaderView.TOOLTIP_MARGIN,
+				Math.min(preferredAbove, safe.bottom - rect.height - ReaderView.TOOLTIP_MARGIN),
+			);
+		tooltip.setCssProps({ left: `${x}px`, top: `${y}px`, visibility: "" });
+	}
+
+	private hideTooltip(): void {
+		// Cleared here rather than only where the two-step ends, so the "a floater
+		// is up" flag can never outlive the floater. Any other route that puts the
+		// tooltip away — navigation, the pane's own citation dismissal, a pointer
+		// leaving — would otherwise strand it set, and a stranded flag makes every
+		// subsequent tap bail out of `handleReaderTap` for the rest of the session.
+		this.referenceTapEl = null;
+		if (!this.tooltipEl) return;
+		this.tooltipEl.setCssProps({ visibility: "" });
+		this.tooltipEl.addClass("clp-hidden");
+	}
+
+	private buildInlineTextPreview(text: string): EpubLinkPreview {
+		const trimmed = text.trim();
+		if (trimmed.length <= ReaderView.TOOLTIP_MAX_CHARS) {
+			return { kind: "text", text: trimmed };
+		}
+		return {
+			kind: "text",
+			text: trimmed.slice(0, ReaderView.TOOLTIP_MAX_CHARS).trimEnd() + "…",
+		};
+	}
+
+	// ─── REGION: Progress & Position ─────────────────────────────────────────
+	private buildProgressSegments(): void {
+		if (!this.progressBarEl) return;
+		this.progressBarEl.querySelectorAll(".clp-progress-segment").forEach((el) => el.remove());
+		const backBtn = this.progressBarEl.querySelector(".clp-progress-back");
+		for (let i = 0; i < this.sections.length; i++) {
+			const seg = createEl("div", { cls: "clp-progress-segment" });
+			seg.dataset.section = String(i);
+			seg.dataset.label = this.sections[i].label;
+			seg.style.flexGrow = String(this.sectionSpreadCounts[i] ?? 1);
+			seg.createEl("div", { cls: "clp-progress-segment-fill" });
+			this.progressBarEl.insertBefore(seg, backBtn);
+		}
+	}
+
+	private updateProgress(): void {
+		if (!this.book) return;
+		// "Is this page bookmarked" is a per-spread answer, and this is the only
+		// method that runs on every spread change — `goToSpread` calls it after
+		// each turn, and mounting calls it too. Hanging the button off the
+		// overlay repaint instead left the state stale until the unit changed,
+		// which looked like it fixing itself at a chapter boundary.
+		this.updateBookmarkButton();
+		const globalSpread = this.getGlobalSpread();
+		const currentSectionIdx = this.getCurrentSectionIndex();
+		if (this.isContinuousFlow()) {
+			const sectionNumber = Math.max(1, currentSectionIdx + 1);
+			const sectionTotal = Math.max(1, this.sections.length);
+			this.globalPageEl?.setText(`Bölüm ${sectionNumber} / ${sectionTotal}`);
+			this.localPageEl?.setText(`Sürekli okuma · ${sectionNumber} / ${sectionTotal}`);
+			this.localPageEl?.removeClass("clp-page-info-max");
+			this.mobileLocalPage = sectionNumber;
+			this.mobilePagesLeft = Math.max(0, sectionTotal - sectionNumber);
+			if (this.mobileFillEl) {
+				this.mobileFillEl.style.width = `${(sectionNumber / sectionTotal) * 100}%`;
+				this.mobileFillEl.removeClass("clp-mobile-progress-full");
+			}
+			this.contentEl.querySelectorAll(".clp-progress-segment").forEach((seg) => {
+				const segment = Number.parseInt((seg as HTMLElement).dataset.section ?? "0", 10);
+				const fill = seg.querySelector<HTMLElement>(".clp-progress-segment-fill");
+				if (!fill) return;
+				if (segment < currentSectionIdx) {
+					fill.setCssProps({ width: "100%" });
+					seg.addClass("clp-progress-complete");
+				} else if (segment === currentSectionIdx) {
+					fill.setCssProps({ width: "100%" });
+					seg.addClass("clp-progress-current");
+				} else {
+					fill.setCssProps({ width: "0%" });
+					seg.removeClass("clp-progress-complete", "clp-progress-current");
+				}
+			});
+			this.toolbarChapterEl?.setText(this.sections[currentSectionIdx]?.label ?? "");
+			this.renderMobilePages();
+			this.layoutMobileProgress();
+			this.updateBackMarker();
+			return;
+		}
+		const total = Math.max(1, this.totalSpreads);
+		if (this.globalPageEl) this.globalPageEl.setText(`${globalSpread + 1} of ${total}`);
+
+		const sectionStart = this.sectionStartSpreads[currentSectionIdx] ?? 0;
+		const sectionCount = this.sectionSpreadCounts[currentSectionIdx] ?? 1;
+		const localSpread = globalSpread - sectionStart;
+		const localPage = Math.max(1, localSpread + 1);
+		if (this.localPageEl) {
+			this.localPageEl.setText(`${localPage} / ${sectionCount}`);
+			this.localPageEl.toggleClass("clp-page-info-max", localPage === sectionCount);
+		}
+		// The phone toolbar's resting label (Mobile/Default). Rides updateProgress
+		// because that already runs on every navigation, and the section index it
+		// just resolved is exactly what the label needs.
+		this.toolbarChapterEl?.setText(this.sections[currentSectionIdx]?.label ?? "");
+
+		// Phone bar: chapter-scoped, so it renders the same localPage/sectionCount
+		// the footer counter already derived — a render variant, not new modelling.
+		this.mobileLocalPage = localPage;
+		this.mobilePagesLeft = Math.max(0, sectionCount - localPage);
+		if (this.mobileFillEl) {
+			this.mobileFillEl.style.width = `${(localPage / Math.max(1, sectionCount)) * 100}%`;
+			this.mobileFillEl.toggleClass("clp-mobile-progress-full", localPage >= sectionCount);
+		}
+		this.renderMobilePages();
+		this.layoutMobileProgress();
+
+		this.contentEl.querySelectorAll(".clp-progress-segment").forEach((seg) => {
+			const sectionIdx = parseInt((seg as HTMLElement).dataset.section ?? "0", 10);
+			const fill = seg.querySelector<HTMLElement>(".clp-progress-segment-fill");
+			if (!fill) return;
+			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
+			const count = this.sectionSpreadCounts[sectionIdx] ?? 1;
+			const end = start + count - 1;
+			if (globalSpread > end) {
+				fill.setCssProps({ width: "100%" });
+				seg.addClass("clp-progress-complete");
+				seg.removeClass("clp-progress-current");
+			} else if (globalSpread >= start) {
+				const local = globalSpread - start;
+				fill.setCssProps({ width: `${((local + 1) / count) * 100}%` });
+				seg.removeClass("clp-progress-complete");
+				seg.addClass("clp-progress-current");
+			} else {
+				fill.setCssProps({ width: "0%" });
+				seg.removeClass("clp-progress-complete");
+				seg.removeClass("clp-progress-current");
+			}
+		});
+		this.updateBackMarker();
+	}
+
+	private onProgressMouseDown(e: MouseEvent): void {
+		// Display-only on touch. The bar is a 16px strip, so every scrub would
+		// start with a mis-seek, and the mobile design demotes whole-book jumping
+		// anyway — a phone reader wants to know how much of the *chapter* is left,
+		// not to navigate by it. The back pill inside the bar is a real button and
+		// keeps working; only the seek gesture is withheld.
+		if (Platform.isMobile) return;
+		if ((e.target as Element).closest(".clp-progress-back, .clp-progress-back-marker")) return;
+		if (!this.book) return;
+		this.isDraggingProgress = true;
+		void this.seekToProgressPosition(e);
+	}
+
+	private onProgressMouseMove(e: MouseEvent): void {
+		// The tooltip it drives is a hover affordance, and touch synthesises
+		// mousemove on tap — so without this a tap near the footer would park a
+		// tooltip on screen with no pointer to move away and dismiss it.
+		if (Platform.isMobile) return;
+		this.pendingProgressMouseEvent = e;
+		if (this.progressTooltipRaf !== null) return;
+		this.progressTooltipRaf = requestAnimationFrame(() => {
+			this.progressTooltipRaf = null;
+			const ev = this.pendingProgressMouseEvent;
+			this.pendingProgressMouseEvent = null;
+			if (!ev) return;
+			this.showProgressTooltip(ev);
+			if (this.isDraggingProgress) void this.seekToProgressPosition(ev);
+		});
+	}
+
+	private showProgressTooltip(e: MouseEvent): void {
+		if (!this.progressBarEl || !this.progressTipEl) return;
+		const seg = (e.target as Element).closest<HTMLElement>(".clp-progress-segment");
+		if (!seg) {
+			this.progressTipEl.addClass("clp-hidden");
+			return;
+		}
+		const label = seg.dataset.label ?? "";
+		if (!label) {
+			this.progressTipEl.addClass("clp-hidden");
+			return;
+		}
+		this.progressTipEl.setText(label);
+		this.progressTipEl.removeClass("clp-hidden");
+		const barRect = this.progressBarEl.getBoundingClientRect();
+		const x = e.clientX - barRect.left;
+		const tipWidth = this.progressTipEl.offsetWidth;
+		this.progressTipEl.style.left = `${Math.max(0, Math.min(x - tipWidth / 2, barRect.width - tipWidth))}px`;
+	}
+
+	private async seekToProgressPosition(e: MouseEvent): Promise<void> {
+		if (!this.progressBarEl || !this.book) return;
+		const seg = (e.target as Element).closest<HTMLElement>(".clp-progress-segment");
+		const barRect = this.progressBarEl.getBoundingClientRect();
+		if (this.isContinuousFlow()) {
+			const fraction = clampReaderFraction((e.clientX - barRect.left) / Math.max(1, barRect.width));
+			this.scrollContinuousToFraction(fraction);
+			this.syncContinuousPosition();
+			this.updateProgress();
+			this.schedulePositionSave();
+			return;
+		}
+		let targetSectionIdx = 0;
+		let sectionFraction = 0;
+
+		if (seg) {
+			targetSectionIdx = parseInt(seg.dataset.section ?? "0", 10);
+			const segRect = seg.getBoundingClientRect();
+			sectionFraction = Math.max(0, Math.min(1, (e.clientX - segRect.left) / Math.max(1, segRect.width)));
+		} else {
+			const fraction = Math.max(0, Math.min(1, (e.clientX - barRect.left) / Math.max(1, barRect.width)));
+			const scaled = fraction * this.sections.length;
+			targetSectionIdx = Math.min(Math.floor(scaled), this.sections.length - 1);
+			sectionFraction = Math.max(0, Math.min(1, scaled - targetSectionIdx));
+		}
+
+		const section = this.sections[targetSectionIdx];
+		if (!section) return;
+		const unitIdx = this.unitIndexBySection.get(section.id) ?? 0;
+		const sectionCount = this.sectionSpreadCounts[targetSectionIdx] ?? 1;
+		const offsetInSection = Math.min(Math.floor(sectionFraction * sectionCount), sectionCount - 1);
+		const offsetInUnit = this.getSpreadOffsetInUnitBySectionId(this.units[unitIdx], section.id);
+		const targetSpread = Math.max(0, Math.min(offsetInUnit + offsetInSection, (this.units[unitIdx]?.spreadCount ?? 1) - 1));
+		await this.mountCurrentUnit(unitIdx, targetSpread);
+	}
+
+	private savePosition(): void {
+		this.previousPosition = {
+			unitIndex: this.currentUnitIndex,
+			spread: this.currentSpread,
+			pct: this.getProgressFraction(),
+		};
+		// A fresh jump supersedes any prior anchor: re-arm the pill at the new
+		// return point and restart the commit count.
+		this.turnsSinceAnchor = 0;
+	}
+
+	/** Current reading fraction (0..1) from the global spread index, for the
+	 *  Library card progress bar. A single-spread book reports 1 (fully visible);
+	 *  0 means the first spread of a multi-spread book, which the Library labels
+	 *  "Unread". */
+	private getProgressFraction(): number {
+		if (this.isContinuousFlow() && this.spreadEl) {
+			return readerScrollFraction(this.spreadEl.scrollTop, this.spreadEl.scrollHeight, this.spreadEl.clientHeight);
+		}
+		if (this.totalSpreads <= 1) return 1;
+		return Math.max(0, Math.min(1, this.getGlobalSpread() / (this.totalSpreads - 1)));
+	}
+
+	/** Persist the live reading position for `path`, merging onto any existing
+	 *  entry so sibling fields (the right-rail `pane` choice) survive — the old
+	 *  bare-object assignment silently dropped them. Caches `pct` for the Library. */
+	private writeBookPosition(path: string): void {
+		// A pass racing a rebuild (or a view torn down mid-load) can hold
+		// transient garbage — never persist it.
+		if (!Number.isFinite(this.currentUnitIndex) || !Number.isFinite(this.currentSpread)) return;
+		const existing = this.plugin.settings.bookPositions[path] ?? {};
+		// totalSpreads <= 1 means the pagination model isn't live yet (mid-load
+		// or mid-rebuild): getProgressFraction() would report 1 ("finished").
+		// Keep the previous pct; genuine one-spread books still get 1 on their
+		// first save because existing.pct starts undefined.
+		const livePct = this.getProgressFraction();
+		const pct = this.totalSpreads > 1 ? livePct : (existing.pct ?? livePct);
+		this.plugin.settings.bookPositions[path] = {
+			...existing,
+			unitIndex: this.currentUnitIndex,
+			spread: this.currentSpread,
+			pct,
+			// Activity, not opening: this runs on page turns (and the close flush),
+			// so a book left open in a background tab doesn't outrank one actually
+			// being read.
+			lastRead: Date.now(),
+		};
+		// Position lives in data.json, not a vault file, so no vault event fires —
+		// poke any open Library so its card ticks live as the reader advances.
+		this.plugin.updateLibraryProgress(path, pct);
+	}
+
+	private schedulePositionSave(): void {
+		const path = this.currentFile?.path;
+		if (!path) return;
+		if (this.positionSaveTimer !== null) window.clearTimeout(this.positionSaveTimer);
+		this.positionSaveTimer = window.setTimeout(() => {
+			this.positionSaveTimer = null;
+			this.writeBookPosition(path);
+			void this.plugin.persistSettings();
+		}, 800);
+	}
+
+	private async goBack(): Promise<void> {
+		if (!this.previousPosition) return;
+		const pos = this.previousPosition;
+		this.previousPosition = null;
+		this.turnsSinceAnchor = 0;
+		if (this.isContinuousFlow() && typeof pos.pct === "number") {
+			this.scrollContinuousToFraction(pos.pct);
+			this.syncContinuousPosition();
+			this.updateProgress();
+			return;
+		}
+		await this.mountCurrentUnit(pos.unitIndex, pos.spread);
+	}
+
+	/** Copy under the phone bar. Two triggers, hence its own method: navigating
+	 *  changes the numbers, revealing the chrome changes which of them is shown.
+	 *  Reading state gets the bare page number (Mobile/Default); chrome-up gets
+	 *  the Apple-Books "N pages left in chapter" line (Mobile/UIActive), which
+	 *  is the information the mobile design says a reader actually wants.
+	 *
+	 *  On a chrome toggle the wording waits for the caption to finish travelling,
+	 *  behind a cross-fade: written immediately it reads as two events in the
+	 *  wrong order — words changing in place, *then* the caption sliding across.
+	 *  The fade isn't decoration either. The two states say different things, so
+	 *  the swap is a hard cut wherever it lands; after the travel it lands in
+	 *  stillness, fully exposed. `.clp-caption-swapping` takes the caption to
+	 *  zero for the length of the move, so the change happens off screen.
+	 *
+	 *  Navigation (chrome state unchanged) still writes at once and never fades,
+	 *  so page turns stay instant. */
+	private renderMobilePages(): void {
+		const el = this.mobilePagesEl;
+		if (!el) return;
+		const chromeUp = this.contentEl.hasClass("clp-chrome-visible");
+		const write = () => {
+			const left = this.mobilePagesLeft;
+			// Resting state only (Mobile/Default/BookmarkActive): a bookmarked
+			// page turns the caption `--bookmark` and gains a glyph. Chrome-up
+			// says "N pages left in chapter", where a mark would mean nothing —
+			// the toolbar's own button is carrying that state by then.
+			const marked = !chromeUp && this.spreadBookmarked;
+			el.empty();
+			el.toggleClass("clp-mobile-pages-marked", marked);
+			if (marked) {
+				setIcon(el.createEl("span", { cls: "clp-mobile-pages-icon" }), BOOKMARK_MODE.icon);
+			}
+			el.createEl("span", {
+				text: !chromeUp
+					? String(this.mobileLocalPage)
+					: left === 0
+						? "Chapter complete"
+						: `${left} page${left === 1 ? "" : "s"} left in chapter`,
+			});
+			this.mobilePagesChromeUp = chromeUp;
+		};
+
+		if (this.mobilePagesTimer !== null) {
+			window.clearTimeout(this.mobilePagesTimer);
+			this.mobilePagesTimer = null;
+		}
+		if (chromeUp === this.mobilePagesChromeUp) {
+			// Also the landing spot for a toggle that reversed mid-swap: the
+			// wording never changed, so drop the fade and leave it visible.
+			el.removeClass("clp-caption-swapping");
+			write();
+			return;
+		}
+		// Fade out where it stands, travel invisible, fade back in already saying
+		// the other thing — the cut itself is never on screen.
+		el.addClass("clp-caption-swapping");
+		// Expanding waits out the navbar first, then travels short; collapsing has
+		// no delay of its own (that token applies under the chrome class only) and
+		// travels long. Two different lengths, matching the navbar.
+		const travel = chromeUp
+			? ReaderView.MOBILE_CAPTION_DELAY_MS + ReaderView.MOBILE_CAPTION_MOVE_IN_MS
+			: ReaderView.MOBILE_CAPTION_MOVE_OUT_MS;
+		this.mobilePagesTimer = window.setTimeout(() => {
+			this.mobilePagesTimer = null;
+			write();
+			el.removeClass("clp-caption-swapping");
+		}, travel);
+	}
+
+	/** Publishes Obsidian's navbar rect to CSS as four custom properties, which
+	 *  is the whole of the phone progress-bar geometry: at rest the bar is the
+	 *  navbar's *straight run* (width − height, the span between the pill's two
+	 *  round caps) sitting on its bottom edge; with the chrome up it grows to
+	 *  the navbar's full rect, so the translucent navbar reads as the bar.
+	 *
+	 *  Measured, not hardcoded, because the navbar's size and inset vary by
+	 *  device and by the floating-nav setting. `getNavbarSlot()` reports layout
+	 *  geometry (`offsetTop`/`offsetHeight`), which is what makes this work at
+	 *  all: the navbar auto-hides by *transform*, so its client rect is 86px
+	 *  out of position exactly when the bar is at rest and needs the number.
+	 *
+	 *  Null slot (iPad, which has no navbar) leaves `clp-navbar-tracked` off and
+	 *  the footer keeps its in-flow desktop layout. */
+	private layoutMobileProgress(): void {
+		if (!Platform.isMobile) return;
+		const root = this.contentEl;
+		// Obsidian pulls the navbar while the keyboard is up, so the slot reads
+		// null and `clp-navbar-tracked` would come off mid-typing — dropping the
+		// whole mobile bar back to the desktop segmented one, which then lays
+		// itself out in the middle of the shrunken viewport.
+		// Hold the last measurement: nothing it describes
+		// has moved, the navbar is only hidden.
+		if (this.softKeyboardUp()) return;
+		const slot = getNavbarSlot();
+		if (!slot) {
+			root.removeClass("clp-navbar-tracked");
+			this.updateBackMarker();
+			return;
+		}
+		const rootRect = root.getBoundingClientRect();
+		const top = slot.top - rootRect.top;
+		root.style.setProperty("--clp-nav-l", `${slot.left - rootRect.left}px`);
+		root.style.setProperty("--clp-nav-t", `${top}px`);
+		root.style.setProperty("--clp-nav-w", `${slot.width}px`);
+		root.style.setProperty("--clp-nav-h", `${slot.height}px`);
+		// Reading area stops above the whole bottom band, not just the navbar.
+		root.style.setProperty("--clp-nav-band", `${Math.max(0, rootRect.height - top)}px`);
+		root.addClass("clp-navbar-tracked");
+		// Both of the marker's inputs just moved: which bar it is placed against
+		// (this class) and how wide that bar is (the chrome's rest/expanded rects).
+		this.updateBackMarker();
+	}
+
+	private updateBackMarker(): void {
+		const backBtn = this.contentEl.querySelector<HTMLElement>(".clp-progress-back");
+		const marker = this.contentEl.querySelector<HTMLElement>(".clp-progress-back-marker");
+		if (!backBtn) return;
+		if (!this.previousPosition || !this.progressBarEl) {
+			backBtn.addClass("clp-hidden");
+			marker?.addClass("clp-hidden");
+			return;
+		}
+		const prevUnit = this.units[this.previousPosition.unitIndex];
+		if (!prevUnit) {
+			backBtn.addClass("clp-hidden");
+			marker?.addClass("clp-hidden");
+			return;
+		}
+		// Pill and dot share the anchor's lifetime — both go when it expires,
+		// which `previousPosition === null` above has already handled.
+		marker?.removeClass("clp-hidden");
+		backBtn.removeClass("clp-hidden");
+
+		// Coordinate system match the fill bar: each section is a flex segment
+		// with equal visual width, so compute x from the segment's actual
+		// offsetLeft + a local fraction within it. Falls back to linear spread
+		// ratio if segments are not yet laid out.
+		const prevGlobalSpread = (this.unitStartSpreads[this.previousPosition.unitIndex] ?? 0) + this.previousPosition.spread;
+		const barWidth = this.progressBarEl.clientWidth;
+		let x = 0;
+		const sectionIdx = this.sectionStartSpreads.findIndex((start, i) => {
+			const count = this.sectionSpreadCounts[i] ?? 1;
+			return prevGlobalSpread >= start && prevGlobalSpread < start + count;
+		});
+		const segEl = sectionIdx >= 0
+			? this.progressBarEl.querySelector<HTMLElement>(`.clp-progress-segment[data-section="${sectionIdx}"]`)
+			: null;
+		// Which bar is on screen, not which platform we are on. The chapter-scoped
+		// bar exists only where a navbar was measured to seat it — the same class
+		// the stylesheet uses to hide the segments — so the two agree by
+		// construction. `Platform.isMobile` was the wrong question and iPad was
+		// the case that showed it: no navbar there, so the book-wide segmented bar
+		// renders while this took the chapter-scoped branch, and a chapter-local
+		// fraction spread across the whole book's width put the return dot far
+		// ahead of the page it stood for. Navigation was always correct — only the
+		// dot lied.
+		if (this.contentEl.hasClass("clp-navbar-tracked")) {
+			// That bar spans the *current chapter*, not the book, so it can place
+			// the return point exactly — as long as the return point is in this
+			// chapter. It is the cross-chapter case that has nowhere to sit:
+			// there the dot parks at whichever end it lies past, which reads as
+			// "this takes you out of the chapter, backwards/forwards".
+			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
+			const count = Math.max(1, this.sectionSpreadCounts[sectionIdx] ?? 1);
+			const current = this.getGlobalSpread();
+			const sameSection = sectionIdx >= 0 && current >= start && current < start + count;
+			if (sameSection) {
+				const localFraction = Math.max(0, Math.min(1, (prevGlobalSpread - start + 0.5) / count));
+				x = localFraction * barWidth;
+			} else {
+				x = prevGlobalSpread <= current ? 0 : barWidth;
+			}
+		} else if (segEl && sectionIdx >= 0) {
+			const start = this.sectionStartSpreads[sectionIdx] ?? 0;
+			const count = Math.max(1, this.sectionSpreadCounts[sectionIdx] ?? 1);
+			const localFraction = Math.max(0, Math.min(1, (prevGlobalSpread - start + 0.5) / count));
+			x = segEl.offsetLeft + segEl.offsetWidth * localFraction;
+		} else {
+			const ratio = this.totalSpreads <= 1 ? 0 : prevGlobalSpread / (this.totalSpreads - 1);
+			x = ratio * barWidth;
+		}
+
+		// Marker dot sits on the bar at the exact return point.
+		if (marker) marker.style.left = `${x}px`;
+
+		// Clamp the pill so it never hangs off the bar edges. The marker dot
+		// on the bar still sits at the true return point, making the spatial
+		// link legible even near the extremes.
+		const btnWidth = backBtn.offsetWidth || 60;
+		const half = btnWidth / 2;
+		const clampedX = Math.max(half, Math.min(barWidth - half, x));
+		backBtn.style.left = `${clampedX}px`;
+	}
+
+	private showSpread(): void {
+		this.contentEl.querySelector(".clp-loading")?.remove();
+		this.spreadEl?.removeClass("clp-hidden");
+		this.revealChrome();
+	}
+
+	/** Dim the page behind whichever keyboard-bearing surface is up — the gloss
+	 *  input or book search. Both designed screens (Mobile/Glossbar/Input,
+	 *  Mobile/BookSearch) specify it, and on a phone it does real work: the
+	 *  keyboard takes half the screen, so what's left of the page reads as
+	 *  competing content rather than context. One computed predicate rather than
+	 *  a set/clear pair at four call sites, which is how these drift. */
+	private syncScrim(): void {
+		if (!Platform.isMobile) return;
+		this.contentEl.toggleClass("clp-scrim", this.searchOpen || this.glossSurface.inputOpen);
+	}
+
+	/** Route a confirmed tap: edge strips turn pages, everything else toggles
+	 *  the chrome. Bails on anything that already means something — an open
+	 *  panel, a live selection, a control — rather than trying to enumerate
+	 *  what a page turn is allowed to sit on top of. */
+	private handleReaderTap(e: MouseEvent): void {
+		if (this.tocOpen || this.pane.isOpen) return;
+		// Book search, the gloss input and a raised annotation preview are all
+		// transient layers over the page, and the tap that dismisses one must not
+		// also turn a page underneath it. The preview's own dismissal happens in
+		// the document click handler, one step further up the bubble path.
+		if (this.searchOpen || this.glossSurface.inputOpen) return;
+		if (this.annotationPreview.hoveredIdx !== -1 || this.referenceTapEl) return;
+		const target = e.target as Element | null;
+		if (target?.closest("button, a[href], input, textarea, .clp-footer, .clp-toc, .clp-highlights-panel, .clp-search-results")) return;
+		// A tap that ends a selection belongs to the gloss grammar — the GlossBar
+		// is opening over it and a page turn would yank the text out from under.
+		const sel = window.getSelection();
+		if (sel && !sel.isCollapsed) return;
+		if (this.isContinuousFlow()) {
+			this.toggleChrome();
+			return;
+		}
+
+		// A page turn deliberately does *not* sync the chrome. It leaves the chrome
+		// state untouched, and the navbar needs no re-asserting: `restoreNavigation`
+		// early-returns on our behalf (see syncMobileChrome), so Obsidian's tap
+		// listener never pulled it back. The sync that used to sit here was a
+		// leftover from the hideNavigation-based approach, and it cost a forced
+		// layout plus a native status-bar bridge call on every turn.
+		const zone = this.tapZoneEdges();
+		if (e.clientX <= zone.left) void this.retreat();
+		else if (e.clientX >= zone.right) void this.advance();
+		else this.toggleChrome();
+	}
+
+	/** Horizontal extent of the two page-turn strips: a third of the reader's
+	 *  width at each edge, leaving the middle third to toggle the chrome.
+	 *
+	 *  Thirds, not anything derived from the chevron buttons: those give ~45px on
+	 *  a phone, narrow enough that taps meant as page turns land in the middle
+	 *  and summon the chrome instead.
+	 *
+	 *  Off the reader's own rect, not the viewport's — they differ under a split
+	 *  — and measured per tap, since a pane can be resized under one. */
+	private tapZoneEdges(): { left: number; right: number } {
+		const root = this.contentEl.getBoundingClientRect();
+		const zone = root.width * ReaderView.TAP_ZONE_SHARE;
+		return { left: root.left + zone, right: root.right - zone };
+	}
+
+	private toggleChrome(): void {
+		if (this.contentEl.hasClass("clp-chrome-visible")) this.hideChrome();
+		else this.revealChrome();
+	}
+
+	private hideChrome(): void {
+		if (!Platform.isMobile) return;
+		if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
+		this.chromeHideTimer = null;
+		this.contentEl.removeClass("clp-chrome-visible");
+		this.syncMobileChrome();
+	}
+
+	/** Drive Obsidian's navbar from our chrome state — without using Obsidian's
+	 *  own `hideNavigation()` / `restoreNavigation()`.
+	 *
+	 *  Those two are wired to a window-level `mousedown` listener registered at
+	 *  app start, so *every* tap restores the navbar and fires a native status-bar
+	 *  fade-in — re-asserting the hidden state afterwards shows as a flicker on
+	 *  every page turn.
+	 *
+	 *  Instead we own the hidden state. `restoreNavigation` early-returns unless
+	 *  `is-hidden-nav` is on the body, so by never setting that class we satisfy
+	 *  its own guard: Obsidian's listener still runs on every tap and does
+	 *  nothing. No interception, no patching.
+	 *
+	 *  Hiding the native status bar in step is what we lose by not calling
+	 *  `hideNavigation()`, so we do it directly (see `statusBarPlugin`). If that
+	 *  is unreachable on device the reader keeps working and the clock stays.
+	 *
+	 *  Phones only. Hiding the status bar changes the top safe-area inset, so the
+	 *  frame resizes whenever the chrome moves — worth it on a phone, where it
+	 *  buys a calmer page. On iPad it buys nothing: Obsidian renders no navbar on
+	 *  a tablet, so the resize *is* the whole visible effect. Hence the gate on
+	 *  form factor rather than `isMobile`. */
+	private syncMobileChrome(): void {
+		if (!Platform.isMobile) return;
+		// A full-screen pane owns the phone: the chrome tap that opened it must not
+		// leave the navbar floating over its chat box, or the status bar over its
+		// header. The keyboard guard and the user's auto-fullscreen setting below
+		// still win — with the navbar up, the pane's own clearance lifts its
+		// pinned controls clear of it.
+		const paneOwnsScreen = this.tocOpen || this.pane.isOpen;
+		const keepVisible =
+			// A reader that isn't the active leaf must not hold the navbar hidden
+			// for whatever the user switched to — this is a body-level class now,
+			// not a per-view one.
+			this.app.workspace.getActiveViewOfType(ReaderView) !== this
+			|| (this.contentEl.hasClass("clp-chrome-visible") && !paneOwnsScreen)
+			// Settings → Appearance → auto fullscreen. Obsidian mirrors it onto
+			// the body, so honouring it costs no private config read.
+			|| !document.body.hasClass("auto-full-screen")
+			// Never pull the navbar out from under an open soft keyboard.
+			|| isTextInputFocused();
+		document.body.toggleClass("clp-immersive", !keepVisible);
+		if (Platform.isPhone) ReaderView.setStatusBarHidden(!keepVisible);
+		// The bar's rest/expanded geometry and the copy under it both hang off
+		// the chrome state, and this runs on every change of it.
+		this.layoutMobileProgress();
+		this.renderMobilePages();
+	}
+
+	/** Capacitor's native StatusBar plugin, or null off-device.
+	 *
+	 *  Obsidian bundles Capacitor and it installs itself onto the global scope, so
+	 *  this is reachable even though it is no part of the plugin API. Resolved
+	 *  once and cached because `registerPlugin` logs a warning when a plugin is
+	 *  already registered — it returns the existing proxy, so repeated calls work
+	 *  but would litter the console. `undefined` means "not looked up yet", `null`
+	 *  means "looked up, not there". */
+	private static statusBarPlugin: CapacitorStatusBar | null | undefined;
+
+	private static setStatusBarHidden(hidden: boolean): void {
+		if (ReaderView.statusBarPlugin === undefined) {
+			const cap = (window as unknown as { Capacitor?: CapacitorGlobal }).Capacitor;
+			ReaderView.statusBarPlugin =
+				cap?.Plugins?.StatusBar ?? cap?.registerPlugin?.("StatusBar") ?? null;
+		}
+		const bar = ReaderView.statusBarPlugin;
+		if (!bar) return;
+		// Native bridge calls reject if the plugin isn't implemented on this
+		// platform; there is nothing to do about that but carry on reading.
+		void (hidden ? bar.hide?.() : bar.show?.())?.catch(() => undefined);
+	}
+
+	/** Touch equivalent of hovering the reader: puts `.clp-chrome-visible` on
+	 *  the root, which drives exactly the rules `.clp-root:hover` drives, then
+	 *  fades it back out. Fired on book open so the toggles announce
+	 *  themselves once — without it the ToC, search and highlights buttons are
+	 *  invisible *and* undiscoverable on a device — and by the centre tap.
+	 *  No-ops on desktop, where `:hover` already handles it.
+	 *
+	 *  isMobile (UX), not isDesktopApp (capability): under `emulateMobile` we
+	 *  want the touch behaviour, since that's the only way to test it. */
+	private revealChrome(): void {
+		if (!Platform.isMobile) return;
+		const root = this.contentEl;
+		root.addClass("clp-chrome-visible");
+		if (this.chromeHideTimer !== null) window.clearTimeout(this.chromeHideTimer);
+		this.chromeHideTimer = window.setTimeout(() => {
+			this.chromeHideTimer = null;
+			root.removeClass("clp-chrome-visible");
+			this.syncMobileChrome();
+		}, ReaderView.CHROME_AUTOHIDE_MS);
+		this.syncMobileChrome();
+	}
+
+	private showError(msg: string): void {
+		const loading = this.contentEl.querySelector(".clp-loading");
+		if (loading) {
+			loading.setText(msg);
+			loading.addClass("clp-error");
+		}
+	}
+}
+
+// ─── REGION: ComprehensibleLearningPortal Plugin ──────────────────────────────────────────
+export default class ComprehensibleLearningPortal extends Plugin {
+	_openingEpub = false;
+	settings: ComprehensibleLearningPortalSettings = { ...DEFAULT_SETTINGS };
+	private importControllers = new Map<string, AbortController>();
+	/** Serial AI lane: several selected books queue instead of spawning competing Codex processes. */
+	private importQueue: Promise<void> = Promise.resolve();
+	/** Debounce timer collapsing a burst of vault events (e.g. a folder move) into
+	 *  a single Library re-scan. */
+	private _libraryRefreshTimer: number | null = null;
+
+	/** PDF Gloss manager — desktop only, absent when the platform gate declines.
+	 *  Held so settings changes and the pane command can reach attached PDFs. */
+	private pdfGloss: PdfGlossManager | null = null;
+
+	async onload(): Promise<void> {
+		await this.loadSettings();
+		// Obsidian's bundled Lucide set predates `book-search` — register the
+		// glyph ourselves (Lucide 24-grid paths scaled onto Obsidian's 100-grid).
+		// setIcon stamps this id as a class on the svg, so it must not collide
+		// with any element class (`.clp-book-search` is the results card).
+		addIcon(
+			"clp-icon-book-search",
+			'<g transform="scale(4.1667)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/><circle cx="10.5" cy="8" r="2.5"/><path d="m13.3 10.8 1.7 1.7"/></g>',
+		);
+		// Product-owned ribbon mark: an open reading surface with a play symbol,
+		// combining the two first-class inputs (EPUB and YouTube) in one icon.
+		addIcon(
+			"clp-portal",
+			'<g transform="scale(4.1667)" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5A2.5 2.5 0 0 1 5.5 3H11v16H5.5A2.5 2.5 0 0 0 3 21.5z"/><path d="M21 5.5A2.5 2.5 0 0 0 18.5 3H13v16h5.5a2.5 2.5 0 0 1 2.5 2.5z"/><path d="m15.5 8 3.5 2.5-3.5 2.5z" fill="currentColor" stroke="none"/></g>',
+		);
+		this.injectFonts();
+		this.registerView(READER_VIEW_TYPE, (leaf) => new ReaderView(leaf, this));
+		this.registerView(LIBRARY_VIEW_TYPE, (leaf) => new LibraryView(leaf, this));
+		this.registerView(STUDY_VIEW_TYPE, (leaf) => new StudyView(leaf, this));
+		this.registerView(YOUTUBE_STORY_VIEW_TYPE, (leaf) => new YoutubeStoryView(leaf, this));
+		this.registerExtensions(["epub"], READER_VIEW_TYPE);
+		this.addSettingTab(new ClpSettingTab(this.app, this));
+		this.addRibbonIcon("clp-portal", "Comprehensible Learning Portal: EPUB veya YouTube ekle", () => this.openContentImportModal());
+		this.addRibbonIcon("library", "Portal kütüphanesini aç", () => this.activateLibraryView());
+		this.addRibbonIcon("graduation-cap", "Study merkezini aç", () => this.activateStudyView());
+		this.addReaderCommands();
+
+		// Make sure the Library folder exists so the empty-state prompt ("drop
+		// .epub files into your Library folder") points somewhere real on a fresh
+		// install. Non-blocking — failure just falls back to lazy creation.
+		void this.ensureLibraryFolder();
+
+		// Intercept epub clicks so a book always lands in its own tab instead of
+		// replacing the active leaf (mirrors Cmd+Click). Two sources: the file
+		// explorer, and internal links inside notes — `.internal-link[data-href]`
+		// covers reading-view anchors and the rendered `source:` property link on
+		// every companion doc, which is the link a reader actually clicks.
+		// Runs in capture phase so it fires before Obsidian's own click handler.
+		// Modified clicks fall through untouched: Cmd/Alt/Shift already carry
+		// their own destination (new tab, split, window) and shouldn't be hijacked.
+		this.registerDomEvent(document, "click", (e: MouseEvent) => {
+			if (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+			const target = e.target as Element;
+			const fileTitle = target.closest<HTMLElement>(".nav-file-title");
+			// `a[data-href]` is deliberately narrow — the reader's own ToC rows are
+			// `div[data-href]` carrying epub-internal hrefs, not vault paths.
+			const link = target.closest<HTMLElement>(".internal-link[data-href], a[data-href]");
+			const href =
+				fileTitle?.dataset.path ??
+				fileTitle?.closest<HTMLElement>(".nav-file")?.dataset.path ??
+				link?.dataset.href;
+			if (!href) return;
+			// Drop any `#heading` / `^block` subpath before the extension test.
+			const linkpath = getLinkpath(href);
+			if (!linkpath.endsWith(".epub")) return;
+			const file = this.app.metadataCache.getFirstLinkpathDest(
+				linkpath,
+				this.app.workspace.getActiveFile()?.path ?? "",
+			);
+			if (!(file instanceof TFile)) return;
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			void this.openEpubInNewTab(file.path);
+		}, { capture: true });
+
+		this.registerVaultEvents();
+
+		// PDF Gloss: augment Obsidian's native PDF viewer with the same GlossBar.
+		// All platforms — the touch grammar the reader worked out is shared, so a
+		// PDF gets the docked bar, the keyboard-aware input and the tap two-step
+		// without a second implementation. Still internally feature-gated: if the
+		// mobile viewer doesn't expose the internals `supportsPdfGloss` checks
+		// for, the PDF simply stays native rather than breaking.
+		this.pdfGloss = new PdfGlossManager(
+			this.app, () => this.settings, () => this.saveSettings(),
+			// A PDF's reading position lands in the same `bookPositions` entry an
+			// epub's does, so the Library card reads one field for both formats.
+			// `persistSettings` rather than `saveSettings`: this fires as the user
+			// scrolls, and there's no theme change to fan out to every open view.
+			(path, pct) => {
+				this.settings.bookPositions[path] = {
+					...this.settings.bookPositions[path],
+					pct,
+					lastRead: Date.now(),
+				};
+				void this.persistSettings();
+				this.updateLibraryProgress(path, pct);
+			},
+		);
+		this.addChild(this.pdfGloss);
+
+		this.app.workspace.onLayoutReady(() => {
+			void this.repairCompanionSourceLinks();
+			void this.resumeInterruptedImports();
+			if (this.settings.onboardingVersion < 1) this.openOnboarding();
+		});
+	}
+
+	/** Companion docs created before 2026-07-24 wrote `source:` unquoted, which
+	 *  YAML parses as a nested list — the wikilink never resolved, so the note
+	 *  had no graph edge to its book. Quote the value wherever the old form
+	 *  survives. Runs each load; no-ops once every doc is migrated. */
+	private async repairCompanionSourceLinks(): Promise<void> {
+		const folder = this.app.vault.getFolderByPath(LIBRARY_ROOT + "/Annotations");
+		if (!folder) return;
+		for (const child of folder.children) {
+			if (!(child instanceof TFile) || child.extension !== "md") continue;
+			try {
+				const content = await this.app.vault.cachedRead(child);
+				const fmEnd = content.indexOf("\n---", 4);
+				if (!content.startsWith("---\n") || fmEnd === -1) continue;
+				if (!/^source: \[\[.*\]\][ \t]*$/m.test(content.slice(0, fmEnd))) continue;
+				await this.app.vault.process(child, (doc) =>
+					doc.replace(/^source: (\[\[.*\]\])[ \t]*$/m, 'source: "$1"'),
+				);
+			} catch (err) {
+				console.error("[ComprehensibleLearningPortal] source-link repair failed", child.path, err);
+			}
+		}
+	}
+
+	/** Create the `Library/` root on load if it's missing, so a fresh install
+	 *  has the folder the empty-state prompt tells users to drop epubs into.
+	 *  Idempotent and tolerant of a parallel creation race. */
+	private async ensureLibraryFolder(): Promise<void> {
+		if (this.app.vault.getFolderByPath(LIBRARY_ROOT)) return;
+		try {
+			await this.app.vault.createFolder(LIBRARY_ROOT);
+		} catch {
+			// Already created (race or pre-existing) — nothing to do.
+		}
+	}
+
+	/** Live Library upkeep. Keeps reading position (and the display override)
+	 *  attached to a book as it moves between collections, keeps the
+	 *  metadata/marks caches honest, and refreshes any open Library view when its
+	 *  `Library/` contents change — no manual reload needed. */
+	private registerVaultEvents(): void {
+		const inLibrary = (p: string) => p === LIBRARY_ROOT || p.startsWith(LIBRARY_ROOT + "/");
+
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				const newPath = file.path;
+				let changed = false;
+				// The one move-survival casualty: reading position is path-keyed.
+				if (this.settings.bookPositions[oldPath]) {
+					this.settings.bookPositions[newPath] = this.settings.bookPositions[oldPath];
+					delete this.settings.bookPositions[oldPath];
+					changed = true;
+				}
+				// The display override is path-keyed too — carry it along.
+				if (this.settings.libraryOverrides[oldPath]) {
+					this.settings.libraryOverrides[newPath] = this.settings.libraryOverrides[oldPath];
+					delete this.settings.libraryOverrides[oldPath];
+					changed = true;
+				}
+				if (changed) void this.persistSettings();
+				invalidateMetaCache(oldPath);
+				invalidateMetaCache(newPath);
+				if (inLibrary(oldPath) || inLibrary(newPath)) this.refreshLibraryViews();
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on("create", (file) => {
+				if (inLibrary(file.path)) this.refreshLibraryViews();
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				invalidateMetaCache(file.path);
+				if (inLibrary(file.path)) this.refreshLibraryViews();
+			})
+		);
+
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				// A companion-doc edit changes a book's mark count; an epub re-save
+				// changes its metadata. Both live under Library/ and want a refresh.
+				if (!inLibrary(file.path)) return;
+				invalidateMetaCache(file.path);
+				this.refreshLibraryViews();
+			})
+		);
+	}
+
+	/** Re-scan + repaint every open Library view, debounced so a burst of vault
+	 *  events (a folder move emits many) collapses into a single refresh. */
+	private refreshLibraryViews(): void {
+		if (this._libraryRefreshTimer !== null) window.clearTimeout(this._libraryRefreshTimer);
+		this._libraryRefreshTimer = window.setTimeout(() => {
+			this._libraryRefreshTimer = null;
+			this.app.workspace.getLeavesOfType(LIBRARY_VIEW_TYPE).forEach((leaf) => {
+				const view = leaf.view;
+				if (view instanceof LibraryView) void view.refresh();
+			});
+		}, 150);
+	}
+
+	/** Surgically update one book's progress on any open Library — fill bar +
+	 *  label only, no re-scan/repaint — so it's cheap enough to call on every
+	 *  reader position-save (gives a live tick when the Library shares a split). */
+	updateLibraryProgress(path: string, pct: number): void {
+		this.app.workspace.getLeavesOfType(LIBRARY_VIEW_TYPE).forEach((leaf) => {
+			const view = leaf.view;
+			if (view instanceof LibraryView) view.updateBookProgress(path, pct);
+		});
+	}
+
+	onunload(): void {
+		document.getElementById("clp-bundled-fonts")?.remove();
+	}
+
+	/** The reader view of the currently-active leaf, or null. Reader commands
+	 *  gate on this so their hotkeys only act while a book is in focus (and fall
+	 *  through to other handlers otherwise). */
+	private activeReaderView(): ReaderView | null {
+		return this.app.workspace.getActiveViewOfType(ReaderView);
+	}
+
+	/** Register reader actions as commands. ONLY modifier-combo / no-default
+	 *  hotkeys live here — Obsidian command hotkeys are global, and a bare key
+	 *  (t / h / 1–5 / ← / →) would steal the keystroke from the editor app-wide.
+	 *  Those bare keys are handled instead by a view-scoped keydown listener in
+	 *  `ReaderView.onOpen`, so they only act while the reader is the active leaf.
+	 *  Each command gates on `activeReaderView()` via `checkCallback` so it does
+	 *  nothing from another pane; users can rebind any of these in Settings →
+	 *  Hotkeys. */
+	private addReaderCommands(): void {
+		this.addCommand({
+			id: "add-content",
+			name: "İçerik ekle",
+			callback: () => this.openContentImportModal(),
+		});
+		this.addCommand({
+			id: "open-library",
+			name: "Open Library",
+			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "l" }],
+			callback: () => this.activateLibraryView(),
+		});
+		this.addCommand({
+			id: "open-study",
+			name: "Study merkezini aç",
+			callback: () => this.activateStudyView(),
+		});
+		this.addCommand({
+			id: "export-bilingual-epub-markdown",
+			name: "Çift dilli EPUB'u Markdown dışa aktar",
+			checkCallback: (checking) => {
+				const reader = this.activeReaderView();
+				if (!reader) return false;
+				if (!checking) void reader.exportBilingualMarkdown();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "open-contextual-lookup",
+			name: "Seçim için bağlamsal açıklamayı aç",
+			checkCallback: (checking) => {
+				const reader = this.activeReaderView();
+				if (!this.settings.quickLookup.enabled || !reader || !reader.glossShortcutMode(1)) return false;
+				if (!checking) reader.openQuickLookupForSelection();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "open-annotations",
+			name: "Open annotation notes",
+			hotkeys: [{ modifiers: ["Mod", "Shift"], key: "a" }],
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) void v.openCompanionDoc();
+				return true;
+			},
+		});
+		this.addCommand({
+			// No default hotkey: `s` toggles it from inside the reader (see the
+			// view-scoped keydown listener); the command exists so users can
+			// bind their own combo — including Cmd+F, which we deliberately
+			// don't claim by default (it would shadow Obsidian's own search).
+			id: "search-in-book",
+			name: "Search in book",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) v.toggleBookSearch();
+				return true;
+			},
+		});
+		this.addCommand({
+			// No default hotkey: `h` toggles it from inside the reader and from a
+			// PDF (both view-scoped keydown listeners); the command exists so the
+			// pane is reachable by a bindable combo, and it is the only affordance
+			// users of a customised PDF toolbar may have.
+			id: "toggle-highlights-pane",
+			name: "Toggle highlights & annotations pane",
+			checkCallback: (checking) => {
+				const reader = this.activeReaderView();
+				const pdf = this.pdfGloss?.activeController() ?? null;
+				if (!reader && !pdf) return false;
+				if (!checking) {
+					if (reader) reader.toggleHighlightsPane();
+					else pdf?.togglePane();
+				}
+				return true;
+			},
+		});
+		this.addCommand({
+			// No default hotkey: `b` toggles it from inside the reader (see the
+			// view-scoped keydown listener); the command exists so users can
+			// bind their own combo.
+			id: "toggle-bookmark",
+			name: "Bookmark this page",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) void v.toggleBookmark();
+				return true;
+			},
+		});
+		this.addCommand({
+			// No default hotkey: 3C-mode toggling is the least-used reader action
+			// and Shift+Mod+3 clashes with the macOS screenshot shortcut. Exposed
+			// for users to bind to a combo of their choosing.
+			id: "toggle-3c-mode",
+			name: "Toggle 3C mode",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) void v.toggleClpMode();
+				return true;
+			},
+		});
+		this.addCommand({
+			// Desktop-only by intent, not capability: this is what a phone's
+			// queued exchanges are waiting for, so offering it on the phone would
+			// just re-attempt the calls that were deferred in the first place.
+			id: "process-pending-ai",
+			name: "Process pending AI requests",
+			checkCallback: (checking) => {
+				if (Platform.isMobile) return false;
+				if (!checking) void this.processPendingAiRequests();
+				return true;
+			},
+		});
+	}
+
+	/** The provider an exchange should be sent to, or null when none is
+	 *  configured. Mirrors the pane's resolution: explicit primary, else first. */
+	activeAiProvider(): AiProvider | null {
+		const primary = this.settings.aiProviders.find(
+			(p) => p.id === this.settings.aiDefaults.primaryProviderId,
+		);
+		return primary ?? this.settings.aiProviders[0] ?? null;
+	}
+
+	async quickLookup(request: QuickLookupRequest): Promise<QuickLookupResult> {
+		const explanationLanguage = this.settings.quickLookup.explanationLanguage;
+		const key = quickLookupCacheKey(this.settings.translation, request, explanationLanguage);
+		const cached = this.settings.quickLookupCache[key];
+		if (cached?.result?.meaning) return cached.result;
+		const result = await analyzeQuickLookup(request, {
+			settings: this.settings.translation,
+			explanationLanguage,
+			provider: this.translationProvider(),
+		});
+		this.settings.quickLookupCache[key] = {
+			result,
+			createdAt: Date.now(),
+			backend: this.settings.translation.backend,
+		};
+		// Keep the small interactive cache bounded independently from the durable
+		// paragraph translation cache. Newest entries win.
+		const entries = Object.entries(this.settings.quickLookupCache);
+		if (entries.length > 1000) {
+			entries.sort((a, b) => b[1].createdAt - a[1].createdAt);
+			this.settings.quickLookupCache = Object.fromEntries(entries.slice(0, 1000));
+		}
+		await this.persistSettings();
+		return result;
+	}
+
+	async applyLegacyMigration(preview: MigrationPreview): Promise<{
+		vocabularyImported: number;
+		annotationsImported: number;
+		verified: boolean;
+	}> {
+		const previous = this.settings.migrationHistory.find(
+			(entry) => entry.fingerprint === preview.fingerprint && entry.verified,
+		);
+		if (previous) return {
+			vocabularyImported: previous.vocabularyImported,
+			annotationsImported: previous.annotationsImported,
+			verified: true,
+		};
+
+		const legacyNotePath = `${LIBRARY_ROOT}/Annotations/Legacy Migration.md`;
+		let vocabularyImported = 0;
+		const migrationKeys: string[] = [];
+		for (const candidate of preview.vocabulary) {
+			const migrationKey = `legacy-${stableHash(`${candidate.sourcePlugin}\n${vocabularyIdentity(candidate)}`)}`;
+			migrationKeys.push(migrationKey);
+			let record = this.settings.study.vocabulary.find((item) => item.migrationKeys?.includes(migrationKey));
+			if (record) continue;
+			const normalized = candidate.term.toLocaleLowerCase("en");
+			record = this.settings.study.vocabulary.find((item) =>
+				item.term.toLocaleLowerCase("en") === normalized || item.lemma.toLocaleLowerCase("en") === normalized,
+			);
+			const now = Date.now();
+			const source: StudySource = {
+				kind: "note",
+				path: legacyNotePath,
+				label: `Eski veri · ${candidate.sourceLabel}`,
+				context: candidate.context,
+			};
+			if (record) {
+				record.migrationKeys = [...(record.migrationKeys ?? []), migrationKey];
+				record.seen++;
+				record.source = source;
+				record.lemma ||= candidate.lemma;
+				record.translation ||= candidate.translation;
+				record.ipa ||= candidate.ipa;
+				record.partOfSpeech ||= candidate.partOfSpeech;
+				record.updatedAt = now;
+			} else {
+				this.settings.study.vocabulary.unshift({
+					id: migrationKey,
+					term: candidate.term,
+					lemma: candidate.lemma || candidate.term,
+					translation: candidate.translation,
+					ipa: candidate.ipa,
+					partOfSpeech: candidate.partOfSpeech,
+					source,
+					seen: 1,
+					status: "new",
+					createdAt: now,
+					updatedAt: now,
+					migrationKeys: [migrationKey],
+				});
+			}
+			vocabularyImported++;
+		}
+
+		let annotationsImported = 0;
+		let annotationContent = "";
+		if (preview.annotations.length) {
+			await this.ensureVaultFolder(`${LIBRARY_ROOT}/Annotations`);
+			const existing = this.app.vault.getAbstractFileByPath(legacyNotePath);
+			if (existing instanceof TFile) {
+				annotationContent = await this.app.vault.cachedRead(existing);
+				const missing = preview.annotations.filter(
+					(item) => !annotationContent.includes(`<!-- clp-legacy:${item.fingerprint} -->`),
+				);
+				if (missing.length) {
+					const addition = missing.map(renderLegacyAnnotationBlock).join("\n\n");
+					await this.app.vault.append(existing, `\n${addition}\n`);
+					annotationsImported = missing.length;
+					annotationContent += `\n${addition}\n`;
+				}
+			} else {
+				annotationContent = renderLegacyAnnotations(preview.annotations, preview.fingerprint);
+				await this.app.vault.create(legacyNotePath, annotationContent);
+				annotationsImported = preview.annotations.length;
+			}
+		}
+
+		const vocabularyVerified = migrationKeys.every((key) =>
+			this.settings.study.vocabulary.some((record) => record.migrationKeys?.includes(key)),
+		);
+		const annotationsVerified = preview.annotations.every((item) =>
+			annotationContent.includes(`<!-- clp-legacy:${item.fingerprint} -->`),
+		);
+		const verified = vocabularyVerified && annotationsVerified;
+		this.settings.migrationHistory.unshift({
+			fingerprint: preview.fingerprint,
+			appliedAt: Date.now(),
+			vocabularyImported,
+			annotationsImported,
+			verified,
+		});
+		this.settings.migrationHistory = this.settings.migrationHistory.slice(0, 20);
+		await this.persistSettings();
+		this.refreshStudyViews();
+		return { vocabularyImported, annotationsImported, verified };
+	}
+
+	async exportStudyMarkdown(): Promise<string> {
+		const rawPath = this.settings.studyPreferences.markdownExportPath.trim() || DEFAULT_STUDY_PREFERENCES.markdownExportPath;
+		const path = normalizePath(rawPath.endsWith(".md") ? rawPath : `${rawPath}.md`);
+		const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+		if (parent) await this.ensureVaultFolder(parent);
+		const content = renderStudyMarkdown(this.settings.study);
+		const existing = this.app.vault.getAbstractFileByPath(path);
+		if (existing instanceof TFile) await this.app.vault.modify(existing, content);
+		else if (existing) throw new Error("Dışa aktarma yolu bir klasörle çakışıyor.");
+		else await this.app.vault.create(path, content);
+		return path;
+	}
+
+	async exportBilingualEpubMarkdown(filePath: string): Promise<string> {
+		const file = this.app.vault.getFileByPath(filePath);
+		if (!file || file.extension !== "epub") throw new Error("Kaynak EPUB bulunamadı.");
+		const data = this.settings.bilingualBooks[filePath];
+		if (!data) throw new Error("Bu kitap için henüz çift dilli çeviri verisi yok.");
+		const book = await parseEpub(await this.app.vault.readBinary(file));
+		try {
+			const chapters = await extractEpubTranslationUnits(book);
+			let exported = 0;
+			let missing = 0;
+			const body: string[] = [];
+			for (const chapter of chapters) {
+				const chapterLines: string[] = [];
+				for (const unit of chapter.units) {
+					const pair = data.paragraphs[unit.id];
+					if (!pair?.translation.trim() || pair.sourceHash !== unit.sourceHash) {
+						missing++;
+						continue;
+					}
+					chapterLines.push(
+						`<!-- clp-pair:${unit.id}:${unit.sourceHash} -->`,
+						"**English**",
+						"",
+						unit.text,
+						"",
+						"**Türkçe**",
+						"",
+						pair.translation,
+						"",
+						"---",
+						"",
+					);
+					exported++;
+				}
+				if (chapterLines.length) body.push(`## ${chapter.label.replace(/[\r\n#]+/g, " ").trim()}`, "", ...chapterLines);
+			}
+			if (!exported) throw new Error("Dışa aktarılabilecek tamamlanmış paragraf çevirisi yok.");
+			const markdown = [
+				"---",
+				"clp-type: bilingual-epub-export",
+				`title: ${JSON.stringify(book.title)}`,
+				`source: ${JSON.stringify(`[[${file.path}]]`)}`,
+				`source-fingerprint: ${data.sourceFingerprint}`,
+				`exported-paragraphs: ${exported}`,
+				`missing-paragraphs: ${missing}`,
+				`updated: ${new Date().toISOString()}`,
+				"---",
+				"",
+				`# ${book.title.replace(/[\r\n#]+/g, " ").trim()}`,
+				"",
+				...body,
+			].join("\n").trimEnd() + "\n";
+			const folder = normalizePath(this.settings.epubMarkdownExportFolder.trim() || "Library/Exports");
+			await this.ensureVaultFolder(folder);
+			const outputPath = normalizePath(`${folder}/${sanitizeFileName(book.title)} - Bilingual.md`);
+			const existing = this.app.vault.getAbstractFileByPath(outputPath);
+			if (existing instanceof TFile) await this.app.vault.modify(existing, markdown);
+			else if (existing) throw new Error("EPUB export yolu bir klasörle çakışıyor.");
+			else await this.app.vault.create(outputPath, markdown);
+			return outputPath;
+		} finally {
+			revokeImageUrls(book);
+		}
+	}
+
+	async saveYoutubeScreenshot(videoId: string, title: string, time: number): Promise<string> {
+		if (this.settings.youtube.screenshotMode === "off") throw new Error("YouTube kare yakalama ayarlarda kapalı.");
+		const bytes = await captureYoutubeFrame(
+			videoId,
+			time,
+			this.settings.youtube.ytDlpCommand,
+			this.settings.youtube.ffmpegCommand,
+		);
+		const folder = normalizePath(`${this.settings.youtube.outputFolder}/${sanitizeFileName(title)}/Screenshots`);
+		await this.ensureVaultFolder(folder);
+		const total = Math.max(0, Math.floor(time));
+		const timestamp = [Math.floor(total / 3600), Math.floor((total % 3600) / 60), total % 60]
+			.map((value) => String(value).padStart(2, "0"))
+			.join("-");
+		const path = this.uniqueVaultFilePath(folder, `${timestamp}.jpg`);
+		await this.app.vault.createBinary(path, bytes);
+		return path;
+	}
+
+	/** Remove an imported Library item after the Library has obtained explicit
+	 * confirmation. YouTube imports are represented by a Markdown story and a
+	 * sibling bilingual EPUB, so either card removes both outputs. Reader
+	 * position/metadata for those exact paths and the matching story cache are
+	 * pruned; Study records and the shared translation cache intentionally stay.
+	 */
+	async deleteImportedContent(input: {
+		path: string;
+		kind: "epub" | "pdf" | "youtube";
+		rawTitle: string;
+		hasCompanion: boolean;
+	}): Promise<{ deleted: string[] }> {
+		const sourcePath = normalizePath(input.path);
+		const candidates = new Set<string>([sourcePath]);
+		const isYoutubeFolder = sourcePath.toLowerCase().startsWith(`${LIBRARY_ROOT.toLowerCase()}/youtube/`);
+		const isYoutube = input.kind === "youtube" || isYoutubeFolder;
+		const lower = sourcePath.toLowerCase();
+		const stem = lower.endsWith(".md") || lower.endsWith(".epub")
+			? sourcePath.replace(/\.(?:md|epub)$/i, "")
+			: sourcePath;
+
+		if (isYoutube && (lower.endsWith(".md") || lower.endsWith(".epub"))) {
+			const markdownPath = normalizePath(`${stem}.md`);
+			const epubPath = normalizePath(`${stem}.epub`);
+			const markdownFile = this.app.vault.getAbstractFileByPath(markdownPath);
+			const epubFile = this.app.vault.getAbstractFileByPath(epubPath);
+			// A Markdown YouTube card is always an imported story. For an EPUB card,
+			// only pair a sibling Markdown file when its frontmatter identifies the
+			// generated story; this avoids deleting a user-provided EPUB by accident.
+			if (lower.endsWith(".md") && epubFile instanceof TFile) candidates.add(epubPath);
+			if (lower.endsWith(".epub") && markdownFile instanceof TFile) {
+				const markdown = await this.app.vault.cachedRead(markdownFile);
+				if (/^clp-type:\s*["']?youtube-story["']?\s*$/im.test(markdown)) candidates.add(markdownPath);
+			}
+		}
+
+		if (input.hasCompanion) candidates.add(companionDocPath(input.rawTitle));
+
+		const youtubeVideoIds = new Set<string>();
+		for (const candidate of candidates) {
+			if (!candidate.toLowerCase().endsWith(".md")) continue;
+			const file = this.app.vault.getAbstractFileByPath(candidate);
+			if (!(file instanceof TFile)) continue;
+			try {
+				const markdown = await this.app.vault.cachedRead(file);
+				const videoId = markdown.match(/^youtube-id:\s*["']?([A-Za-z0-9_-]{11})["']?\s*$/im)?.[1];
+				if (videoId) youtubeVideoIds.add(videoId);
+			} catch {
+				// The file can still be removed if its metadata is unreadable.
+			}
+		}
+
+		const deleted: string[] = [];
+		for (const candidate of candidates) {
+			const file = this.app.vault.getAbstractFileByPath(candidate);
+			if (file instanceof TFile) {
+				await this.app.vault.delete(file);
+				deleted.push(candidate);
+			}
+			delete this.settings.bookPositions[candidate];
+			delete this.settings.libraryOverrides[candidate];
+			delete this.settings.bilingualBooks[candidate];
+		}
+
+		if (youtubeVideoIds.size) {
+			this.settings.youtubeStoryCache = Object.fromEntries(
+				Object.entries(this.settings.youtubeStoryCache).filter(([, entry]) => !youtubeVideoIds.has(entry.videoId)),
+			);
+			for (const [playlistId, progress] of Object.entries(this.settings.youtubePlaylistProgress)) {
+				progress.videoIds = progress.videoIds.filter((id) => !youtubeVideoIds.has(id));
+				progress.completedVideoIds = progress.completedVideoIds.filter((id) => !youtubeVideoIds.has(id));
+				progress.currentIndex = Math.min(progress.currentIndex, progress.videoIds.length);
+				if (!progress.videoIds.length) delete this.settings.youtubePlaylistProgress[playlistId];
+			}
+		}
+		await this.persistSettings();
+		return { deleted };
+	}
+
+	async addVocabulary(
+		term: string,
+		source: StudySource,
+		analysis?: { lemma: string; ipa: string; partOfSpeech: string; turkish: string; explanation: string },
+	): Promise<void> {
+		const normalized = term.normalize("NFKC").replace(/\s+/g, " ").trim();
+		if (!normalized) return;
+		const key = normalized.toLocaleLowerCase("en");
+		const existing = this.settings.study.vocabulary.find(
+			(record) => record.lemma.toLocaleLowerCase("en") === key || record.term.toLocaleLowerCase("en") === key,
+		);
+		if (existing && source.bridgeId && existing.bridgeIds?.includes(source.bridgeId)) {
+			new Notice("Bu highlight Vocabulary'ye daha önce aktarıldı.");
+			return;
+		}
+		if (existing) {
+			if (source.bridgeId) existing.bridgeIds = [...(existing.bridgeIds ?? []), source.bridgeId];
+			existing.seen++;
+			existing.source = source;
+			existing.updatedAt = Date.now();
+			new Notice(`${existing.term} tekrar görüldü (${existing.seen}).`);
+		} else {
+			const now = Date.now();
+			this.settings.study.vocabulary.unshift({
+				id: `v-${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+				term: normalized,
+				lemma: normalized,
+				translation: "",
+				source,
+				seen: 1,
+				status: "new",
+				createdAt: now,
+				updatedAt: now,
+				bridgeIds: source.bridgeId ? [source.bridgeId] : undefined,
+			});
+			new Notice(`${normalized} Vocabulary'ye kaydedildi.`);
+		}
+		await this.persistSettings();
+		this.refreshStudyViews();
+		const record = existing ?? this.settings.study.vocabulary[0];
+		if (!record) return;
+		if (analysis) {
+			record.lemma = analysis.lemma || record.term;
+			record.ipa = analysis.ipa;
+			record.partOfSpeech = analysis.partOfSpeech;
+			record.translation = analysis.turkish;
+			record.explanation = analysis.explanation;
+			record.updatedAt = Date.now();
+			await this.persistSettings();
+			this.refreshStudyViews();
+			return;
+		}
+		if (record.translation) return;
+		try {
+			const analysis = await analyzeVocabulary(record.term, source.context, {
+				settings: this.settings.translation,
+				provider: this.translationProvider(),
+			});
+			record.lemma = analysis.lemma;
+			record.ipa = analysis.ipa;
+			record.partOfSpeech = analysis.partOfSpeech;
+			record.translation = analysis.turkish;
+			record.explanation = analysis.explanation;
+			record.updatedAt = Date.now();
+			await this.persistSettings();
+			this.refreshStudyViews();
+		} catch (error) {
+			new Notice(`Kelime analizi tamamlanamadı: ${errorMessage(error)}`);
+		}
+	}
+
+	async addGrammar(text: string, source: StudySource): Promise<void> {
+		if (source.bridgeId && this.settings.study.grammar.some((item) => item.source.bridgeId === source.bridgeId)) {
+			new Notice("Bu highlight Grammar'a daha önce aktarıldı.");
+			return;
+		}
+		const now = Date.now();
+		const record = {
+			id: `g-${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+			title: "Grammar analizi hazırlanıyor…",
+			content: "",
+			grammarPoints: [] as string[],
+			syntaxTree: "",
+			source,
+			createdAt: now,
+			updatedAt: now,
+		};
+		this.settings.study.grammar.unshift(record);
+		await this.persistSettings();
+		this.refreshStudyViews();
+		new Notice("Grammar analizi Study merkezine eklendi.");
+		try {
+			const analysis = await analyzeGrammar(text, {
+				settings: this.settings.translation,
+				provider: this.translationProvider(),
+			});
+			record.title = analysis.title;
+			record.content = analysis.explanation;
+			record.grammarPoints = analysis.grammarPoints;
+			record.syntaxTree = analysis.syntaxTree;
+			record.updatedAt = Date.now();
+			await this.persistSettings();
+			this.refreshStudyViews();
+		} catch (error) {
+			record.title = "Grammar analizi tamamlanamadı";
+			record.content = errorMessage(error);
+			await this.persistSettings();
+			this.refreshStudyViews();
+		}
+	}
+
+	async addShadowing(text: string, source: StudySource): Promise<void> {
+		const normalized = text.normalize("NFKC").replace(/\s+/g, " ").trim();
+		const existing = this.settings.study.shadowing.find((record) => record.text === normalized && record.source.path === source.path);
+		if (existing) {
+			existing.updatedAt = Date.now();
+			new Notice("Bu pasaj Shadowing listesinde zaten var.");
+		} else {
+			const now = Date.now();
+			this.settings.study.shadowing.unshift({
+				id: `s-${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+				text: normalized,
+				source,
+				attempts: [],
+				createdAt: now,
+				updatedAt: now,
+			});
+			new Notice("Pasaj Shadowing çalışmasına eklendi.");
+		}
+		await this.persistSettings();
+		this.refreshStudyViews();
+	}
+
+	async deleteStudyRecord(kind: "vocabulary" | "grammar" | "mistakes" | "shadowing", id: string): Promise<void> {
+		const collection = this.settings.study[kind];
+		const index = collection.findIndex((record) => record.id === id);
+		if (index < 0) return;
+		collection.splice(index, 1);
+		await this.persistSettings();
+		this.refreshStudyViews();
+		new Notice("Study kaydı silindi.");
+	}
+
+	async submitShadowing(id: string, input: string): Promise<ShadowingAttempt | null> {
+		const record = this.settings.study.shadowing.find((item) => item.id === id);
+		if (!record) return null;
+		const attempt = compareShadowing(record.text, input);
+		record.attempts ??= [];
+		record.attempts.push(attempt);
+		record.updatedAt = Date.now();
+		if (attempt.differences.length) {
+			const now = Date.now();
+			this.settings.study.mistakes.unshift({
+				id: `m-${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+				original: input.trim(),
+				correction: record.text,
+				category: "shadowing transcription",
+				explanation: attempt.differences.join(", "),
+				status: "open",
+				source: record.source,
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		await this.persistSettings();
+		this.refreshStudyViews();
+		return attempt;
+	}
+
+	private refreshStudyViews(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(STUDY_VIEW_TYPE)) {
+			if (leaf.view instanceof StudyView) leaf.view.refresh();
+		}
+	}
+
+	/** Drain every companion doc flagged with pending exchanges (Mobile spec,
+	 *  Tier 1). Vault-wide and book-agnostic — the docs are found through
+	 *  `metadataCache`, so nothing has to be open. */
+	private async processPendingAiRequests(): Promise<void> {
+		const provider = this.activeAiProvider();
+		if (!provider) {
+			new Notice("No AI provider configured — open plugin settings.");
+			return;
+		}
+		const docs = findFlaggedDocs(this.app);
+		if (!docs.length) {
+			new Notice("No pending AI requests.");
+			return;
+		}
+		const notice = new Notice(`Processing ${docs.length} document${docs.length === 1 ? "" : "s"}…`, 0);
+		let resolved = 0;
+		let failed = 0;
+		let rateLimited = false;
+		for (const file of docs) {
+			const res = await processPendingInFile(this.app, file, this.settings, provider);
+			resolved += res.resolved;
+			failed += res.failed;
+			// The limit is per account, not per document, so the next doc would
+			// hit it too. Stop and keep the rest queued.
+			if (res.rateLimited) { rateLimited = true; break; }
+		}
+		notice.hide();
+		const done = `Processed ${resolved} request${resolved === 1 ? "" : "s"}`;
+		new Notice(
+			rateLimited
+				? `${done} — rate limited, the rest stay queued. Run again later.`
+				: failed
+					? `${done}, ${failed} failed.`
+					: `${done}.`,
+		);
+		// Any open reader is now showing stale callouts.
+		for (const leaf of this.app.workspace.getLeavesOfType(READER_VIEW_TYPE)) {
+			const view = leaf.view;
+			if (view instanceof ReaderView) void view.reloadAnnotations();
+		}
+	}
+
+	private injectFonts(): void {
+		document.getElementById("clp-bundled-fonts")?.remove();
+		// `url` is a base64 data URL baked into main.js at build time (see the
+		// font imports at the top of this file), so the @font-face sources are
+		// self-contained and render wherever the plugin runs — no reliance on a
+		// fonts/ folder on disk, which BRAT never delivers to testers.
+		const faces: { family: string; weight: string; style: string; url: string }[] = [
+			{ family: "Rosarivo", weight: "400", style: "normal", url: RosarivoRegular },
+			{ family: "Rosarivo", weight: "400", style: "italic", url: RosarivoItalic },
+			{ family: "Labrada", weight: "100 900", style: "normal", url: LabradaRegular },
+			{ family: "Labrada", weight: "100 900", style: "italic", url: LabradaItalic },
+			{ family: "Kode Mono", weight: "400 700", style: "normal", url: KodeMono },
+		];
+		const css = faces.map(({ family, weight, style, url }) =>
+			`@font-face { font-family: "${family}"; font-weight: ${weight}; font-style: ${style}; src: url("${url}") format("truetype"); }`
+		).join("\n");
+
+		// obsidianmd/no-forbidden-elements is switched off for this file in
+		// eslint.config.mjs because of this one site: the @font-face data-URLs
+		// are compiled into main.js (esbuild dataurl loader), so this CSS only
+		// exists at runtime and can't live in styles.css.
+		const el = document.createElement("style");
+		el.id = "clp-bundled-fonts";
+		el.textContent = css;
+		document.head.appendChild(el);
+	}
+
+	/** Open a Library book in its own tab, in whichever viewer owns its format:
+	 *  the reader for `.epub`, Obsidian's native viewer (which PDF Gloss then
+	 *  attaches to) for `.pdf`. Both dedup onto an already-open tab, so a second
+	 *  card click reveals rather than duplicates. */
+	async openBookInNewTab(filePath: string): Promise<void> {
+		if (filePath.toLowerCase().endsWith(".md")) {
+			const note = this.app.vault.getFileByPath(filePath);
+			if (!note) return;
+			const existing = this.app.workspace.getLeavesOfType(YOUTUBE_STORY_VIEW_TYPE)
+				.find((leaf) => leaf.view.getState().file === filePath);
+			if (existing) {
+				await this.app.workspace.revealLeaf(existing);
+				return;
+			}
+			const leaf = this.app.workspace.getLeaf("tab");
+			await leaf.setViewState({ type: YOUTUBE_STORY_VIEW_TYPE, active: true, state: { file: note.path } });
+			await this.app.workspace.revealLeaf(leaf);
+			return;
+		}
+		if (!filePath.toLowerCase().endsWith(".pdf")) {
+			await this.openEpubInNewTab(filePath);
+			return;
+		}
+		const file = this.app.vault.getFileByPath(filePath);
+		if (!file) return;
+		const existing = this.app.workspace
+			.getLeavesOfType("pdf")
+			.find((leaf) => (leaf.view as { file?: TFile }).file?.path === filePath);
+		if (existing) {
+			await this.app.workspace.revealLeaf(existing);
+			return;
+		}
+		const leaf = this.app.workspace.getLeaf("tab");
+		await leaf.openFile(file);
+		await this.app.workspace.revealLeaf(leaf);
+	}
+
+	async openEpubInNewTab(filePath: string): Promise<void> {
+		// Dedup: if this book is already open in a reader tab, reveal it rather than
+		// spawning a duplicate (mirrors the companion-doc dedup, and makes Library
+		// card clicks idempotent). `getState().file` is the live path.
+		const existing = this.app.workspace.getLeavesOfType(READER_VIEW_TYPE).find((leaf) => {
+			const view = leaf.view;
+			return view instanceof ReaderView && view.getState()?.file === filePath;
+		});
+		if (existing) {
+			await this.app.workspace.revealLeaf(existing);
+			return;
+		}
+		this._openingEpub = true;
+		const leaf = this.app.workspace.getLeaf("tab");
+		await leaf.setViewState({
+			type: READER_VIEW_TYPE,
+			active: true,
+			state: { file: filePath },
+		});
+		await this.app.workspace.revealLeaf(leaf);
+		this._openingEpub = false;
+	}
+
+	openContentImportModal(): void {
+		this.resumePendingImports();
+		new ContentImportModal(this.app, this).open();
+	}
+
+	/** Reconnect jobs whose controller disappeared while the import modal was
+	 * closed or the plugin was reloaded. Active controllers are left untouched;
+	 * playlist child jobs are deliberately skipped because their parent rebuilds
+	 * and resumes them from the playlist checkpoint. */
+	private resumePendingImports(): void {
+		const stale = this.settings.importJobs.filter((job) =>
+			job.status === "running"
+			&& !this.importControllers.has(job.id)
+			&& !(job.source === "youtube" && typeof job.checkpoint.playlistId === "string"),
+		);
+		if (!stale.length) return;
+		for (const job of stale) this.putImportJob(patchImportJob(job, { status: "queued", error: undefined }));
+		void this.persistSettings().then(() => {
+			for (const job of stale) {
+				if (job.source === "epub") void this.enqueueImport(() => this.runEpubImportJob(job.id, () => undefined));
+				else void this.enqueueImport(() => this.runYoutubeImportJob(job.id, () => undefined));
+			}
+		});
+	}
+
+	getImportJobs(): ImportJob[] {
+		return [...this.settings.importJobs].sort((a, b) => b.updatedAt - a.updatedAt);
+	}
+
+	async prepareImportedEpub(
+		filePath: string,
+		onProgress: (progress: ImportProgress) => void,
+	): Promise<string> {
+		const existing = this.settings.importJobs.find(
+			(job) => job.source === "epub" && job.input === filePath && job.status !== "complete",
+		);
+		if (existing) {
+			if (["failed", "cancelled", "paused"].includes(existing.status)) {
+				await this.retryImportJob(existing.id, onProgress);
+			}
+			return existing.id;
+		}
+		const job = createImportJob("epub", filePath, this.app.vault.getFileByPath(filePath)?.basename ?? filePath);
+		this.putImportJob(job);
+		await this.persistSettings();
+		void this.enqueueImport(() => this.runEpubImportJob(job.id, onProgress));
+		return job.id;
+	}
+
+	cancelImportJob(id: string): void {
+		this.importControllers.get(id)?.abort();
+		const job = this.findImportJob(id);
+		if (job && (job.status === "queued" || job.status === "running")) {
+			this.putImportJob(patchImportJob(job, { status: "cancelled", error: "Kullanıcı tarafından durduruldu." }));
+			void this.persistSettings();
+		}
+	}
+
+	async retryImportJob(id: string, onProgress: (progress: ImportProgress) => void): Promise<void> {
+		const job = this.findImportJob(id);
+		if (!job || this.importControllers.has(id) || !["failed", "cancelled", "paused"].includes(job.status)) return;
+		this.putImportJob(patchImportJob(job, { status: "queued", error: undefined }));
+		await this.persistSettings();
+		if (job.source === "epub") void this.enqueueImport(() => this.runEpubImportJob(id, onProgress));
+		else await this.enqueueImport(() => this.runYoutubeImportJob(id, onProgress));
+	}
+
+	async importYoutubeUrl(
+		url: string,
+		onProgress: (progress: ImportProgress) => void,
+	): Promise<void> {
+		const identity = parseYoutubeInput(url);
+		const isPlaylistBatch = Boolean(identity.playlistId && this.settings.youtube.playlistBehavior === "batch");
+		const job = createImportJob("youtube", url, isPlaylistBatch ? "YouTube playlisti" : "YouTube hikâyesi");
+		this.putImportJob(job);
+		await this.persistSettings();
+		await this.enqueueImport(() => this.runYoutubeImportJob(job.id, onProgress));
+	}
+
+	private enqueueImport(task: () => Promise<void>): Promise<void> {
+		const run = this.importQueue.then(task, task);
+		this.importQueue = run.catch(() => undefined);
+		return run;
+	}
+
+	private async runEpubImportJob(
+		jobId: string,
+		onProgress?: (progress: ImportProgress) => void,
+	): Promise<void> {
+		const original = this.findImportJob(jobId);
+		if (!original || this.importControllers.has(jobId) || !canStartImportJob(original)) return;
+		const file = this.app.vault.getFileByPath(original.input);
+		if (!file) {
+			await this.failImportJob(original, "Kaynak EPUB artık Vault içinde bulunmuyor.", onProgress);
+			return;
+		}
+		const controller = new AbortController();
+		this.importControllers.set(jobId, controller);
+		let job = patchImportJob(original, { status: "running", stage: "extracting", error: undefined });
+		this.putImportJob(job);
+		this.emitImportProgress(job, "Kitabın bölümleri ve paragrafları çıkarılıyor…", onProgress);
+		try {
+			const book = await parseEpub(await this.app.vault.readBinary(file));
+			const chapters = await extractEpubTranslationUnits(book);
+			let bilingual = this.settings.bilingualBooks[file.path];
+			const fresh = createBilingualBook(file.path, book, chapters);
+			const sameSource = bilingual?.sourceFingerprint === fresh.sourceFingerprint
+				&& job.checkpoint.sourceFingerprint === fresh.sourceFingerprint;
+			if (!sameSource) bilingual = fresh;
+			revokeImageUrls(book);
+			const startChapter = sameSource
+				? Math.min(chapters.length, Math.max(0, Number(job.checkpoint.nextChapter ?? 0)))
+				: 0;
+			const initialProgress = epubTranslationProgress(chapters, bilingual.translatedChapters);
+			if (!initialProgress.total) throw new Error("EPUB içinde çevrilebilir metin bulunamadı.");
+			bilingual.translatedChapters = initialProgress.validTranslatedChapters;
+			let completedChapters = initialProgress.completed;
+			job = patchImportJob(job, {
+				stage: "translating",
+				total: initialProgress.total,
+				completed: completedChapters,
+				checkpoint: { ...job.checkpoint, nextChapter: startChapter, sourceFingerprint: fresh.sourceFingerprint },
+			});
+			this.putImportJob(job);
+			for (let index = startChapter; index < chapters.length; index++) {
+				if (controller.signal.aborted) throw new DOMException("Durduruldu", "AbortError");
+				const chapter = chapters[index];
+				this.emitImportProgress(job, `${chapter.label} Türkçeye çevriliyor…`, onProgress);
+				if (chapter.units.length) {
+					const translated = await translateUnits(chapter.units, {
+						settings: this.settings.translation,
+						cache: this.settings.translationCache,
+						context: "epub",
+						provider: this.translationProvider(),
+						signal: controller.signal,
+						onProgress: (completed, total) => {
+							onProgress?.({
+								stage: "translating",
+								message: `${chapter.label}: ${completed}/${total} paragraf`,
+								current: completedChapters,
+								total: initialProgress.total,
+								jobId,
+							});
+						},
+						onCheckpoint: async () => {
+							// The chapter checkpoint intentionally stays at `index` until
+							// every paragraph is complete. Persisted cache entries make a
+							// crash-resume skip successful batches within that chapter.
+							await this.persistSettings();
+						},
+					});
+					for (const pair of translated.pairs) bilingual.paragraphs[pair.id] = pair;
+					if (!bilingual.translatedChapters.includes(chapter.spineIndex)) {
+						bilingual.translatedChapters.push(chapter.spineIndex);
+						completedChapters++;
+					}
+				}
+				bilingual.updatedAt = Date.now();
+				this.settings.bilingualBooks[file.path] = bilingual;
+				job = patchImportJob(job, {
+					completed: completedChapters,
+					checkpoint: { ...job.checkpoint, nextChapter: index + 1 },
+				});
+				this.putImportJob(job);
+				await this.persistSettings();
+				if (chapter.units.length) this.refreshBilingualReaders(file.path);
+			}
+			job = patchImportJob(job, {
+				status: "complete",
+				stage: "complete",
+				completed: initialProgress.total,
+				total: initialProgress.total,
+			});
+			this.putImportJob(job);
+			await this.persistSettings();
+			this.emitImportProgress(job, "Kitabın çift dilli sürümü hazır.", onProgress);
+		} catch (error) {
+			const aborted = controller.signal.aborted || (error as Error).name === "AbortError";
+			job = patchImportJob(job, {
+				status: aborted ? "cancelled" : "failed",
+				error: aborted ? "İşlem durduruldu; devam edildiğinde son bölümden başlayacak." : errorMessage(error),
+			});
+			this.putImportJob(job);
+			await this.persistSettings();
+			onProgress?.({
+				stage: aborted ? "cancelled" : "failed",
+				message: job.error ?? "İşlem tamamlanamadı.",
+				current: job.completed,
+				total: job.total,
+				jobId,
+			});
+		} finally {
+			this.importControllers.delete(jobId);
+		}
+	}
+
+	/** Process a playlist serially. Each video gets the existing single-video
+	 *  pipeline and its own checkpoint, while this parent job stores the compact
+	 *  playlist-level completed-id set after every successful video. */
+	private async runYoutubePlaylistImport(
+		parentJob: ImportJob,
+		rawUrl: string,
+		playlistId: string,
+		controller: AbortController,
+		onProgress?: (progress: ImportProgress) => void,
+	): Promise<void> {
+		let job = patchImportJob(parentJob, { displayName: "YouTube playlisti", stage: "extracting", error: undefined });
+		this.putImportJob(job);
+		this.emitImportProgress(job, "Playlist videoları listeleniyor…", onProgress);
+		const entries = await fetchYoutubePlaylistEntries(rawUrl, this.settings.youtube.ytDlpCommand, controller.signal);
+		const existing = this.settings.youtubePlaylistProgress[playlistId];
+		const completed = new Set(
+			(existing?.completedVideoIds ?? []).filter((videoId) => entries.some((entry) => entry.videoId === videoId)),
+		);
+		const progress: YoutubePlaylistProgress = {
+			playlistId,
+			sourceUrl: rawUrl,
+			videoIds: entries.map((entry) => entry.videoId),
+			completedVideoIds: [...completed],
+			currentIndex: Math.min(entries.length, Math.max(0, existing?.currentIndex ?? 0)),
+			updatedAt: Date.now(),
+		};
+		this.settings.youtubePlaylistProgress[playlistId] = progress;
+		job = patchImportJob(job, {
+			stage: "extracting",
+			total: entries.length,
+			completed: completed.size,
+			checkpoint: { ...job.checkpoint, playlistId, videoCount: entries.length, nextIndex: progress.currentIndex },
+		});
+		this.putImportJob(job);
+		await this.persistSettings();
+
+		let firstOutputPath = "";
+		let failures = 0;
+		for (let index = 0; index < entries.length; index++) {
+			if (controller.signal.aborted) throw new DOMException("Durduruldu", "AbortError");
+			const entry = entries[index];
+			if (completed.has(entry.videoId)) continue;
+
+			const videoUrl = `https://www.youtube.com/watch?v=${entry.videoId}`;
+			let child = createImportJob("youtube", videoUrl, entry.title);
+			child = patchImportJob(child, {
+				checkpoint: { playlistId, playlistIndex: entry.index, videoId: entry.videoId },
+			});
+			this.putImportJob(child);
+			await this.persistSettings();
+			const abortChild = (): void => this.importControllers.get(child.id)?.abort();
+			controller.signal.addEventListener("abort", abortChild, { once: true });
+			try {
+				await this.runYoutubeImportJob(child.id, (childProgress) => {
+					onProgress?.({
+						...childProgress,
+						stage: childProgress.stage === "complete" ? "indexing" : childProgress.stage,
+						current: completed.size,
+						total: entries.length,
+						jobId: job.id,
+						message: `Playlist ${index + 1}/${entries.length} · ${entry.title}: ${childProgress.message}`,
+					});
+				}, false);
+			} finally {
+				controller.signal.removeEventListener("abort", abortChild);
+			}
+
+			const finished = this.findImportJob(child.id);
+			if (finished?.status === "complete") {
+				completed.add(entry.videoId);
+				if (!firstOutputPath && typeof finished.checkpoint.outputPath === "string") firstOutputPath = finished.checkpoint.outputPath;
+			} else {
+				failures++;
+			}
+			progress.completedVideoIds = [...completed];
+			progress.currentIndex = index + 1;
+			progress.updatedAt = Date.now();
+			this.settings.youtubePlaylistProgress[playlistId] = progress;
+			job = patchImportJob(job, {
+				completed: completed.size,
+				checkpoint: { ...job.checkpoint, nextIndex: index + 1, lastVideoId: entry.videoId },
+			});
+			this.putImportJob(job);
+			await this.persistSettings();
+		}
+
+		const complete = failures === 0;
+		job = patchImportJob(job, {
+			status: complete ? "complete" : "failed",
+			stage: complete ? "complete" : "indexing",
+			completed: completed.size,
+			error: complete ? undefined : `${failures} video işlenemedi; playlisti yeniden çalıştırarak yalnızca eksikleri deneyebilirsin.`,
+		});
+		this.putImportJob(job);
+		await this.persistSettings();
+		if (complete) {
+			this.emitImportProgress(job, `Playlist hazır: ${completed.size}/${entries.length} video kaydedildi.`, onProgress);
+		} else {
+			onProgress?.({
+				stage: "failed",
+				message: `${completed.size}/${entries.length} video kaydedildi; ${failures} video bekliyor.`,
+				current: completed.size,
+				total: entries.length,
+				jobId: job.id,
+			});
+		}
+		if (firstOutputPath) await this.openBookInNewTab(firstOutputPath);
+		this.refreshLibraryViews();
+	}
+
+	private async runYoutubeImportJob(
+		jobId: string,
+		onProgress?: (progress: ImportProgress) => void,
+		openOutput = true,
+	): Promise<void> {
+		const original = this.findImportJob(jobId);
+		if (!original || this.importControllers.has(jobId) || !canStartImportJob(original)) return;
+		const controller = new AbortController();
+		this.importControllers.set(jobId, controller);
+		let job = patchImportJob(original, { status: "running", stage: "extracting", error: undefined });
+		this.putImportJob(job);
+		this.emitImportProgress(job, "Video bilgisi ve İngilizce altyazı alınıyor…", onProgress);
+		try {
+			const identity = parseYoutubeInput(original.input);
+			if (identity.playlistId && this.settings.youtube.playlistBehavior === "batch") {
+				await this.runYoutubePlaylistImport(job, original.input, identity.playlistId, controller, onProgress);
+				return;
+			}
+			if (!identity.videoId) {
+				if (identity.playlistId) throw new Error("Playlist bağlantısında seçili bir video yok. Önce listeden bir video açıp onun bağlantısını kullan.");
+				throw new Error("Geçerli bir YouTube video kimliği bulunamadı.");
+			}
+			if (identity.playlistId && this.settings.youtube.playlistBehavior === "reject") {
+				throw new Error("Bu bağlantı bir playlist içeriyor. YouTube ayarlarında seçili videoyu işleme seçeneğini aç.");
+			}
+			const storyCacheKey = youtubeStoryCacheKey(original.input, {
+				sourceLanguage: this.settings.youtube.sourceLanguage,
+				captionPreference: this.settings.youtube.captionPreference,
+				pauseMode: this.settings.youtube.pauseMode,
+				pauseSeconds: this.settings.youtube.pauseSeconds,
+				topicTransitions: this.settings.youtube.topicTransitions,
+			});
+			const cachedStory = this.settings.youtubeStoryCache[storyCacheKey];
+			let transcript: YoutubeTranscript;
+			let paragraphs: YoutubeParagraph[];
+			if (cachedStory?.paragraphs.length) {
+				transcript = {
+					videoId: cachedStory.videoId,
+					title: cachedStory.title,
+					sourceLanguage: cachedStory.sourceLanguage,
+					segments: [],
+				};
+				paragraphs = cachedStory.paragraphs;
+				job = patchImportJob(job, {
+					displayName: transcript.title,
+					stage: "segmenting",
+					checkpoint: { ...job.checkpoint, storyCacheKey, videoId: transcript.videoId },
+				});
+				this.putImportJob(job);
+				this.emitImportProgress(job, "Önbellekteki hikâye paragrafları kullanılıyor…", onProgress);
+			} else {
+				let fetchedTranscript: YoutubeTranscript | undefined;
+				try {
+					fetchedTranscript = await fetchYoutubeTranscript(original.input, {
+						preferredLanguage: this.settings.youtube.sourceLanguage,
+						captionPreference: this.settings.youtube.captionPreference,
+					});
+				} catch (primaryError) {
+					let captionError: unknown = primaryError;
+					if (this.settings.youtube.captionFallback === "yt-dlp") {
+						try {
+							this.emitImportProgress(job, "Doğrudan altyazı alınamadı; yt-dlp deneniyor…", onProgress);
+							fetchedTranscript = await fetchYoutubeTranscriptWithYtDlp(
+								original.input,
+								this.settings.youtube.sourceLanguage,
+								this.settings.youtube.ytDlpCommand,
+							);
+						} catch (error) {
+							captionError = error;
+						}
+					}
+					if (!fetchedTranscript) {
+						const fallback = this.settings.youtube.noCaptionFallback;
+						const approved = fallback === "automatic"
+							|| (fallback === "ask" && await this.confirmWhisperFallback(original.input));
+						if (!approved) throw captionError;
+						this.emitImportProgress(job, "Altyazı yok; ses yerel Whisper ile yazıya çevriliyor…", onProgress);
+						fetchedTranscript = await fetchYoutubeTranscriptWithWhisper(
+							original.input,
+							this.settings.youtube.sourceLanguage,
+							{
+								ytDlpCommand: this.settings.youtube.ytDlpCommand,
+								ffmpegCommand: this.settings.youtube.ffmpegCommand,
+								whisperCommand: this.settings.youtube.whisperCommand,
+								whisperModel: this.settings.youtube.whisperModel,
+								signal: controller.signal,
+							},
+						);
+					}
+				}
+				if (!fetchedTranscript) throw new Error("Video metni alınamadı.");
+				transcript = fetchedTranscript;
+				if (controller.signal.aborted) throw new DOMException("Durduruldu", "AbortError");
+				job = patchImportJob(job, { displayName: transcript.title, stage: "segmenting" });
+				this.putImportJob(job);
+				this.emitImportProgress(job, "Uzun duraklamalar bulunuyor…", onProgress);
+				let topicBoundaryStarts: number[] = [];
+				if (this.settings.youtube.topicTransitions) {
+					this.emitImportProgress(job, "AI konu ve sahne geçişlerini inceliyor…", onProgress);
+					try {
+						topicBoundaryStarts = await detectTopicBoundaryStarts(transcript.segments, {
+							settings: this.settings.translation,
+							provider: this.translationProvider(),
+							signal: controller.signal,
+						});
+					} catch (error) {
+						if (controller.signal.aborted || (error as Error).name === "AbortError") throw error;
+						this.emitImportProgress(job, `AI konu analizi kullanılamadı; dilsel sınırlarla devam ediliyor (${errorMessage(error)}).`, onProgress);
+					}
+				}
+				paragraphs = buildStoryParagraphs(transcript.segments, {
+					pauseSeconds: this.settings.youtube.pauseMode === "custom" ? this.settings.youtube.pauseSeconds : undefined,
+					topicTransitions: this.settings.youtube.topicTransitions,
+					topicBoundaryStarts,
+				});
+				if (!paragraphs.length) throw new Error("Altyazıdan okunabilir paragraf üretilemedi.");
+				this.settings.youtubeStoryCache[storyCacheKey] = {
+					videoId: transcript.videoId,
+					title: transcript.title,
+					sourceLanguage: transcript.sourceLanguage,
+					paragraphs,
+					createdAt: Date.now(),
+				};
+				this.settings.youtubeStoryCache = Object.fromEntries(
+					Object.entries(this.settings.youtubeStoryCache)
+						.sort(([, left], [, right]) => right.createdAt - left.createdAt)
+						.slice(0, 50),
+				);
+				job = patchImportJob(job, {
+					checkpoint: { ...job.checkpoint, storyCacheKey, videoId: transcript.videoId },
+				});
+				this.putImportJob(job);
+				await this.persistSettings();
+			}
+			if (controller.signal.aborted) throw new DOMException("Durduruldu", "AbortError");
+			job = patchImportJob(job, { stage: "translating", total: paragraphs.length, completed: 0 });
+			this.putImportJob(job);
+			let pairMap: Record<string, TranslationPair> = {};
+			if (this.settings.youtube.autoTranslate) {
+				const translated = await translateUnits(paragraphs, {
+					settings: this.settings.translation,
+					cache: this.settings.translationCache,
+					context: "youtube",
+					provider: this.translationProvider(),
+					signal: controller.signal,
+					onProgress: (completed, total) => {
+						job = patchImportJob(job, { completed, total });
+						this.putImportJob(job);
+						this.emitImportProgress(job, `Hikâye paragrafları çevriliyor: ${completed}/${total}`, onProgress);
+					},
+					onCheckpoint: async () => {
+						// Persist both the paragraph checkpoint and the translation
+						// cache, so an application crash does not repeat finished AI work.
+						await this.persistSettings();
+					},
+				});
+				pairMap = Object.fromEntries(translated.pairs.map((pair) => [pair.id, pair]));
+			} else {
+				job = patchImportJob(job, { completed: paragraphs.length });
+			}
+			job = patchImportJob(job, { stage: "indexing" });
+			this.putImportJob(job);
+			this.emitImportProgress(job, "Hikâye kütüphaneye kaydediliyor…", onProgress);
+			const outputFolder = normalizePath(this.settings.youtube.outputFolder.trim() || DEFAULT_YOUTUBE_SETTINGS.outputFolder);
+			await this.ensureVaultFolder(outputFolder);
+			const safeTitle = sanitizeFileName(transcript.title);
+			const epubPath = this.uniqueVaultFilePath(outputFolder, `${safeTitle}.epub`);
+			const epubBytes = await renderYoutubeStoryEpub(transcript, paragraphs, pairMap);
+			const epubData = epubBytes.buffer.slice(epubBytes.byteOffset, epubBytes.byteOffset + epubBytes.byteLength) as ArrayBuffer;
+			const epubFile = await this.app.vault.createBinary(epubPath, epubData);
+			job = patchImportJob(job, {
+				status: "complete",
+				stage: "complete",
+				completed: paragraphs.length,
+				checkpoint: {
+					...job.checkpoint,
+					outputPath: epubFile.path,
+					videoId: transcript.videoId,
+				},
+			});
+			this.putImportJob(job);
+			await this.persistSettings();
+			this.emitImportProgress(job, "YouTube hikâyesi hazır.", onProgress);
+			if (openOutput) await this.openBookInNewTab(epubFile.path);
+			this.refreshLibraryViews();
+		} catch (error) {
+			const aborted = controller.signal.aborted || (error as Error).name === "AbortError";
+			job = patchImportJob(job, {
+				status: aborted ? "cancelled" : "failed",
+				error: aborted ? "İşlem durduruldu." : errorMessage(error),
+			});
+			this.putImportJob(job);
+			await this.persistSettings();
+			onProgress?.({
+				stage: aborted ? "cancelled" : "failed",
+				message: job.error ?? "İşlem tamamlanamadı.",
+				current: job.completed,
+				total: job.total,
+				jobId,
+			});
+		} finally {
+			this.importControllers.delete(jobId);
+		}
+	}
+
+	private translationProvider(): AiProvider | null {
+		const backend = this.settings.translation.backend;
+		if (backend === "codex" || backend === "opencode" || backend === "pi") return null;
+		const matches = this.settings.aiProviders.filter((provider) =>
+			backend === "openai" ? provider.kind === "openai"
+				: backend === "anthropic" ? provider.kind === "anthropic"
+					: backend === "google" || backend === "antigravity" ? provider.kind === "google"
+					: provider.kind === "openai-compatible" && provider.localRuntime === "ollama"
+		);
+		return matches.find((provider) => provider.id === this.settings.translation.apiProviderId)
+			?? matches[0]
+			?? null;
+	}
+
+	private findImportJob(id: string): ImportJob | undefined {
+		return this.settings.importJobs.find((job) => job.id === id);
+	}
+
+	private putImportJob(job: ImportJob): void {
+		const index = this.settings.importJobs.findIndex((candidate) => candidate.id === job.id);
+		if (index >= 0) this.settings.importJobs[index] = job;
+		else this.settings.importJobs.unshift(job);
+		this.settings.importJobs = this.settings.importJobs
+			.sort((a, b) => b.updatedAt - a.updatedAt)
+			.slice(0, 50);
+	}
+
+	private emitImportProgress(
+		job: ImportJob,
+		message: string,
+		onProgress?: (progress: ImportProgress) => void,
+	): void {
+		onProgress?.({
+			stage: job.stage === "complete" ? "complete" : job.stage,
+			message,
+			current: job.completed,
+			total: job.total,
+			jobId: job.id,
+		});
+	}
+
+	private async failImportJob(
+		job: ImportJob,
+		message: string,
+		onProgress?: (progress: ImportProgress) => void,
+	): Promise<void> {
+		const failed = patchImportJob(job, { status: "failed", error: message });
+		this.putImportJob(failed);
+		await this.persistSettings();
+		onProgress?.({ stage: "failed", message, jobId: job.id });
+	}
+
+	private async resumeInterruptedImports(): Promise<void> {
+		const resume: ImportJob[] = [];
+		for (const job of this.settings.importJobs) {
+			if (job.status !== "running" && job.status !== "queued") continue;
+			const paused = patchImportJob(job, { status: "paused", error: "Obsidian kapandığı için son checkpoint'ten sürdürülüyor." });
+			this.putImportJob(paused);
+			resume.push(paused);
+		}
+		await this.persistSettings();
+		for (const job of resume) void this.retryImportJob(job.id, () => undefined);
+	}
+
+	private refreshBilingualReaders(filePath: string): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(READER_VIEW_TYPE)) {
+			const view = leaf.view;
+			if (view instanceof ReaderView && view.getState().file === filePath) view.refreshBilingualContent();
+		}
+	}
+
+	private async ensureVaultFolder(path: string): Promise<void> {
+		let current = "";
+		for (const part of path.split("/").filter(Boolean)) {
+			current = current ? `${current}/${part}` : part;
+			if (!this.app.vault.getAbstractFileByPath(current)) await this.app.vault.createFolder(current);
+		}
+	}
+
+	private uniqueVaultFilePath(folder: string, fileName: string): string {
+		const dot = fileName.lastIndexOf(".");
+		const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
+		const extension = dot > 0 ? fileName.slice(dot) : "";
+		let path = `${folder}/${fileName}`;
+		let count = 2;
+		while (this.app.vault.getAbstractFileByPath(path)) path = `${folder}/${stem} ${count++}${extension}`;
+		return path;
+	}
+
+	async loadSettings(): Promise<void> {
+		const data = (await this.loadData()) as Partial<ComprehensibleLearningPortalSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+		this.settings.translation = {
+			...DEFAULT_TRANSLATION_SETTINGS,
+			...(data?.translation ?? {}),
+		};
+		const codexModelNeedsMigration = this.settings.translation.codexModel !== CODEX_LEARNING_MODEL;
+		this.settings.translation.codexModel = CODEX_LEARNING_MODEL;
+		let needsPersist = false;
+		this.settings.quickLookup = {
+			...DEFAULT_QUICK_LOOKUP_SETTINGS,
+			...(data?.quickLookup ?? {}),
+		};
+		if (this.settings.quickLookup.trigger !== "selection" && this.settings.quickLookup.trigger !== "double-click") {
+			// v1 used hover, which could fire an LLM request simply because the
+			// pointer rested over text. Migrate existing vaults to the deliberate
+			// double-click/long-press trigger.
+			this.settings.quickLookup.trigger = "double-click";
+			needsPersist = true;
+		}
+		this.settings.quickLookupCache = data?.quickLookupCache ?? {};
+		this.settings.migrationHistory = Array.isArray(data?.migrationHistory) ? data.migrationHistory : [];
+		this.settings.youtube = {
+			...DEFAULT_YOUTUBE_SETTINGS,
+			...(data?.youtube ?? {}),
+		};
+		// The original release defaulted to selected-video. Upgrade an untouched
+		// old setting once, while preserving an explicit reject choice and future
+		// user changes after this marker is written.
+		if ((data?.youtubeDefaultsVersion ?? 0) < 1) {
+			if (!data?.youtube?.playlistBehavior || data.youtube.playlistBehavior === "selected-video") {
+				this.settings.youtube.playlistBehavior = "batch";
+			}
+			this.settings.youtubeDefaultsVersion = 1;
+			needsPersist = true;
+		}
+		this.settings.youtubeStoryCache = data?.youtubeStoryCache ?? {};
+		this.settings.youtubePlaylistProgress = data?.youtubePlaylistProgress ?? {};
+		this.settings.study = {
+			vocabulary: data?.study?.vocabulary ?? [],
+			grammar: data?.study?.grammar ?? [],
+			mistakes: data?.study?.mistakes ?? [],
+			shadowing: data?.study?.shadowing ?? [],
+		};
+		this.settings.studyPreferences = {
+			...DEFAULT_STUDY_PREFERENCES,
+			...(data?.studyPreferences ?? {}),
+		};
+		this.settings.importJobs = Array.isArray(data?.importJobs) ? data.importJobs : [];
+		this.settings.translationCache = data?.translationCache ?? {};
+		this.settings.bilingualBooks = data?.bilingualBooks ?? {};
+		// Beta-only: re-show the Library feedback hint after every reload/update so
+		// testers are reminded where to report. Reset in-memory on each load (no
+		// persist needed); drop this line together with FEEDBACK_BETA for 1.0.
+		this.settings.feedbackHintShown = false;
+		// Fresh object with every mode filled — guards against a shared
+		// reference to DEFAULT_SETTINGS and forward-compat for new modes.
+		this.settings.systemPrompts = { ...DEFAULT_SYSTEM_PROMPTS, ...(data?.systemPrompts ?? {}) };
+		needsPersist = this.migrateApiKeysToSecretStorage() || codexModelNeedsMigration || needsPersist;
+		// This installation has no user-authored prompt set. Version 3 therefore
+		// replaces every earlier general-reader prompt unconditionally so no
+		// purpose-mismatched text survives an intermediate migration/reload.
+		if ((data?.systemPromptVersion ?? 1) < 3) {
+			this.settings.systemPrompts = { ...DEFAULT_SYSTEM_PROMPTS };
+			this.settings.systemPromptVersion = 3;
+			needsPersist = true;
+		}
+		// Migration: the model used to fall back to a hardcoded id per kind when
+		// `defaultModel` was unset, so an Anthropic/OpenAI provider added before
+		// this could be saved without one and still work. That fallback is gone
+		// — the model is now exactly what the picker shows — so stamp the same
+		// id onto anything that relied on it. Local providers are skipped: they
+		// had no fallback to lose, and their model list is the server's.
+		for (const provider of this.settings.aiProviders) {
+			if (provider.defaultModel) continue;
+			const starter = starterModel(provider.kind);
+			if (!starter) continue;
+			provider.defaultModel = starter;
+			needsPersist = true;
+		}
+		// Migration: installs predating the AI master switch that already have a
+		// provider configured come up with AI on, so they don't silently drop to
+		// Lite (matches the "auto-on with provider" rule for new providers).
+		if (data && data.aiFeaturesEnabled === undefined && this.settings.aiProviders.length > 0) {
+			this.settings.aiFeaturesEnabled = true;
+			needsPersist = true;
+		}
+		if (needsPersist) await this.persistSettings();
+	}
+
+	/** Move any legacy plaintext API keys out of data.json and into Obsidian's
+	 *  encrypted secret storage, then resolve every provider's runtime
+	 *  `apiKey` from storage. Returns true if a migration write occurred. */
+	private migrateApiKeysToSecretStorage(): boolean {
+		let migrated = false;
+		for (const provider of this.settings.aiProviders) {
+			if (provider.apiKey && !provider.apiKeyId) {
+				const id = `clp-apikey-${this.randomSecretId()}`;
+				this.app.secretStorage.setSecret(id, provider.apiKey);
+				provider.apiKeyId = id;
+				migrated = true;
+			}
+			provider.apiKey = provider.apiKeyId
+				? (this.app.secretStorage.getSecret(provider.apiKeyId) ?? undefined)
+				: undefined;
+		}
+		return migrated;
+	}
+
+	private randomSecretId(): string {
+		return (Math.random().toString(36) + Math.random().toString(36))
+			.replace(/[^a-z0-9]/g, "")
+			.slice(0, 16);
+	}
+
+	/** Write settings to disk with resolved API keys stripped — only the
+	 *  `apiKeyId` reference is persisted, never the key itself. */
+	persistSettings(): Promise<void> {
+		const data: ComprehensibleLearningPortalSettings = {
+			...this.settings,
+			aiProviders: this.settings.aiProviders.map((p) => {
+				const copy = { ...p };
+				delete copy.apiKey;
+				return copy;
+			}),
+		};
+		return this.saveData(data);
+	}
+
+	async saveSettings(): Promise<void> {
+		await this.persistSettings();
+		this.app.workspace.getLeavesOfType(READER_VIEW_TYPE).forEach((leaf) => {
+			const view = leaf.view;
+			if (view instanceof ReaderView) {
+				view.applyThemeClasses();
+				view.applyAiFeaturesState();
+				view.applyReaderFontSize();
+				view.applyTranslationSettings();
+				view.applyReaderFlowSetting();
+			}
+		});
+		this.app.workspace.getLeavesOfType(LIBRARY_VIEW_TYPE).forEach((leaf) => {
+			const view = leaf.view;
+			if (view instanceof LibraryView) view.applyThemeClasses();
+		});
+		this.pdfGloss?.applySettings();
+	}
+
+	openOnboarding(): void {
+		new PortalOnboardingModal(
+			this.app,
+			this.settings.translation,
+			async () => {
+				this.settings.onboardingVersion = 1;
+				await this.persistSettings();
+			},
+		).open();
+	}
+
+	private confirmWhisperFallback(_url: string): Promise<boolean> {
+		return new Promise((resolve) => {
+			new ClpDecisionModal(
+				this.app,
+				"Bu videoda İngilizce altyazı bulunamadı",
+				"Portal videonun sesini geçici bir klasöre indirip ffmpeg ile hazırlayabilir ve bilgisayarındaki yerel Whisper komutuyla yazıya çevirebilir. Bu işlem uzun sürebilir; geçici ses işlem sonunda silinir. Devam edilsin mi?",
+				"Whisper ile devam et",
+				resolve,
+			).open();
+		});
+	}
+
+	downloadSettingsBackup(): void {
+		const providers = this.settings.aiProviders.map((provider) => ({
+			id: provider.id,
+			kind: provider.kind,
+			endpoint: provider.endpoint,
+			localRuntime: provider.localRuntime,
+			defaultModel: provider.defaultModel,
+		}));
+		const backup = {
+			schemaVersion: 1,
+			product: "comprehensible-learning-portal",
+			exportedAt: new Date().toISOString(),
+			settings: {
+				translation: this.settings.translation,
+				quickLookup: this.settings.quickLookup,
+				youtube: this.settings.youtube,
+				studyPreferences: this.settings.studyPreferences,
+				clpMode: this.settings.clpMode,
+				clpTheme: this.settings.clpTheme,
+				readerFontSize: this.settings.readerFontSize,
+				readerFlow: this.settings.readerFlow,
+				epubMarkdownExportFolder: this.settings.epubMarkdownExportFolder,
+				aiFeaturesEnabled: this.settings.aiFeaturesEnabled,
+				streaming: this.settings.streaming,
+				showBareFlaggedConversations: this.settings.showBareFlaggedConversations,
+				deferAiToDesktop: this.settings.deferAiToDesktop,
+				systemPrompts: this.settings.systemPrompts,
+				providers,
+				primaryProviderId: this.settings.aiDefaults.primaryProviderId,
+			},
+		};
+		const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+		const url = URL.createObjectURL(blob);
+		const anchor = document.createElement("a");
+		anchor.href = url;
+		anchor.download = `comprehensible-learning-portal-settings-${new Date().toISOString().slice(0, 10)}.json`;
+		anchor.click();
+		window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+	}
+
+	async restoreSettingsBackup(file: File): Promise<void> {
+		if (file.size > 1024 * 1024) throw new Error("Ayar dosyası 1 MB sınırını aşıyor.");
+		let parsed: unknown;
+		try { parsed = JSON.parse(await file.text()) as unknown; }
+		catch { throw new Error("Seçilen dosya geçerli JSON değil."); }
+		if (!isRecord(parsed) || parsed.schemaVersion !== 1 || parsed.product !== "comprehensible-learning-portal") {
+			throw new Error("Bu dosya desteklenen Portal ayar yedeği değil.");
+		}
+		const source = isRecord(parsed.settings) ? parsed.settings : null;
+		if (!source) throw new Error("Yedekte settings nesnesi bulunamadı.");
+		if (isRecord(source.translation)) this.settings.translation = { ...this.settings.translation, ...source.translation };
+		this.settings.translation.codexModel = CODEX_LEARNING_MODEL;
+		if (isRecord(source.quickLookup)) this.settings.quickLookup = { ...this.settings.quickLookup, ...source.quickLookup };
+		if (isRecord(source.youtube)) this.settings.youtube = { ...this.settings.youtube, ...source.youtube };
+		if (isRecord(source.studyPreferences)) this.settings.studyPreferences = { ...this.settings.studyPreferences, ...source.studyPreferences };
+		if (source.clpMode === "obsidian" || source.clpMode === "3c") this.settings.clpMode = source.clpMode;
+		if (source.clpTheme === "light" || source.clpTheme === "dark") this.settings.clpTheme = source.clpTheme;
+		if (source.readerFontSize === null || typeof source.readerFontSize === "number") this.settings.readerFontSize = source.readerFontSize;
+		if (source.readerFlow === "paged" || source.readerFlow === "continuous") this.settings.readerFlow = source.readerFlow;
+		if (typeof source.epubMarkdownExportFolder === "string") this.settings.epubMarkdownExportFolder = normalizePath(source.epubMarkdownExportFolder);
+		for (const key of ["aiFeaturesEnabled", "streaming", "showBareFlaggedConversations", "deferAiToDesktop"] as const) {
+			if (typeof source[key] === "boolean") this.settings[key] = source[key];
+		}
+		if (isRecord(source.systemPrompts)) {
+			for (const mode of ["explain", "examine", "exclaim", "enquiry"] as AiPromptMode[]) {
+				if (typeof source.systemPrompts[mode] === "string") this.settings.systemPrompts[mode] = source.systemPrompts[mode];
+			}
+			this.settings.systemPromptVersion = 3;
+		}
+		if (Array.isArray(source.providers)) {
+			const restored: AiProvider[] = [];
+			for (const raw of source.providers) {
+				if (!isRecord(raw) || typeof raw.id !== "string") continue;
+				if (raw.kind !== "openai" && raw.kind !== "anthropic" && raw.kind !== "google" && raw.kind !== "openai-compatible") continue;
+				const existing = this.settings.aiProviders.find((provider) => provider.id === raw.id);
+				const provider: AiProvider = { id: raw.id, kind: raw.kind };
+				if (typeof raw.endpoint === "string") provider.endpoint = raw.endpoint;
+				if (raw.localRuntime === "lm-studio" || raw.localRuntime === "ollama" || raw.localRuntime === "generic") provider.localRuntime = raw.localRuntime;
+				if (typeof raw.defaultModel === "string") provider.defaultModel = raw.defaultModel;
+				if (existing?.apiKeyId) {
+					provider.apiKeyId = existing.apiKeyId;
+					provider.apiKey = existing.apiKey;
+				}
+				restored.push(provider);
+			}
+			this.settings.aiProviders = restored;
+		}
+		this.settings.aiDefaults.primaryProviderId = typeof source.primaryProviderId === "string"
+			? source.primaryProviderId
+			: null;
+		await this.saveSettings();
+	}
+
+	/** Open (or reveal) the Library home view, reusing an already-open Library
+	 *  leaf rather than spawning duplicates. */
+	private async activateLibraryView(): Promise<void> {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(LIBRARY_VIEW_TYPE)[0];
+		if (!leaf) {
+			leaf = workspace.getLeaf("tab");
+			await leaf.setViewState({ type: LIBRARY_VIEW_TYPE, active: true });
+		}
+		await workspace.revealLeaf(leaf);
+	}
+
+	private async activateStudyView(): Promise<void> {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(STUDY_VIEW_TYPE)[0];
+		if (!leaf) {
+			leaf = workspace.getLeaf("tab");
+			await leaf.setViewState({ type: STUDY_VIEW_TYPE, active: true });
+		}
+		await workspace.revealLeaf(leaf);
+	}
+}
+
+// ─── REGION: Settings Tab ────────────────────────────────────────────────────
+/** Plugin settings tab. AI provider configuration only — theme/3C-mode
+ *  toggles live in the ToC footer (per-leaf, immediate-effect surface).
+ *
+ *  Each provider is rendered as an inline editor with a "Test connection"
+ *  button (calls `probeProvider()`) and a delete affordance. The default-
+ *  model picker selects which provider new conversations use; every mode
+ *  falls through to `primaryProviderId`. */
+// ─── Beta feedback form ──────────────────────────────────────────────────────
+// Opens an anonymous Google Form in the browser with the plugin/Obsidian/OS
+// versions prefilled. Flip FEEDBACK_BETA to false (or delete the Setting block in
+// display()) for the public 1.0 build.
+const FEEDBACK_BETA = false;
+const FEEDBACK_FORM_BASE =
+	"https://docs.google.com/forms/d/e/1FAIpQLSeHKYS9X0lG4ty2ZiRTry5FDBl2GOCbeeBxBBsGbRKdHVBlRg/viewform";
+const FEEDBACK_ENTRY = {
+	pluginVersion: "entry.1098526630",
+	obsidianVersion: "entry.855869142",
+	os: "entry.1381515979",
+};
+
+function feedbackOsLabel(): string {
+	if (Platform.isMacOS) return "macOS";
+	if (Platform.isWin) return "Windows";
+	if (Platform.isLinux) return "Linux";
+	if (Platform.isIosApp) return "iOS";
+	if (Platform.isAndroidApp) return "Android";
+	return "Unknown";
+}
+
+/** Build the prefilled Google Form URL. OS comes from Obsidian's `Platform` (not
+ *  `navigator`, which the ESLint plugin flags). Opened in the system browser. */
+function buildFeedbackUrl(pluginVersion: string): string {
+	const params = new URLSearchParams({ usp: "pp_url" });
+	params.set(FEEDBACK_ENTRY.pluginVersion, pluginVersion);
+	params.set(FEEDBACK_ENTRY.obsidianVersion, apiVersion);
+	params.set(FEEDBACK_ENTRY.os, feedbackOsLabel());
+	return `${FEEDBACK_FORM_BASE}?${params.toString()}`;
+}
+
+class ClpModelPickerModal extends SuggestModal<string> {
+	constructor(app: App, private models: string[], private onPick: (model: string) => void) {
+		super(app);
+		this.setPlaceholder("Sağlayıcı veya model ara…");
+	}
+
+	getSuggestions(query: string): string[] {
+		const normalized = query.trim().toLowerCase();
+		return this.models.filter((model) => model.toLowerCase().includes(normalized));
+	}
+
+	renderSuggestion(model: string, element: HTMLElement): void {
+		element.createSpan({ text: model });
+	}
+
+	onChooseSuggestion(model: string): void {
+		this.onPick(model);
+	}
+}
+
+class ClpDecisionModal extends Modal {
+	private decided = false;
+
+	constructor(
+		app: App,
+		private heading: string,
+		private message: string,
+		private confirmLabel: string,
+		private decision: (approved: boolean) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.heading);
+		this.contentEl.createEl("p", { text: this.message });
+		const actions = this.contentEl.createEl("div", { cls: "clp-confirm-actions" });
+		const cancel = actions.createEl("button", { text: "Vazgeç" });
+		const confirm = actions.createEl("button", { cls: "mod-cta", text: this.confirmLabel });
+		cancel.addEventListener("click", () => { this.answer(false); this.close(); });
+		confirm.addEventListener("click", () => { this.answer(true); this.close(); });
+	}
+
+	onClose(): void {
+		this.answer(false);
+		this.contentEl.empty();
+	}
+
+	private answer(value: boolean): void {
+		if (this.decided) return;
+		this.decided = true;
+		this.decision(value);
+	}
+}
+
+class PortalOnboardingModal extends Modal {
+	private page = 0;
+
+	constructor(
+		app: App,
+		private translation: TranslationSettings,
+		private finish: () => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void { this.render(); }
+	onClose(): void { this.contentEl.empty(); }
+
+	private render(): void {
+		this.contentEl.empty();
+		this.modalEl.addClass("clp-onboarding-modal");
+		const pages = [
+			{
+				title: "Comprehensible Learning Portal'a hoş geldin",
+				body: "EPUB ve YouTube içeriklerini tek yerden içe aktarır; İngilizce metni seçilebilir Türkçe veya İngilizce bağlamsal açıklama, Gloss, TTS ve tek Study merkeziyle çalıştırır.",
+				items: ["Tek eklenti; zorunlu community-plugin bağımlılığı yok", "Orijinal EPUB değiştirilmez", "Vocabulary, Grammar, Mistakes ve Shadowing birlikte"],
+			},
+			{
+				title: "Codex varsayılan sağlayıcıdır",
+				body: "Kitap/YouTube çevirisi ve öğrenme açıklamaları masaüstünde Codex CLI ile çalışır. İstersen daha sonra OpenAI, Anthropic veya Ollama ekleyebilirsin.",
+				items: ["Kaynak dil: İngilizce", "Hedef ve açıklama dili: Türkçe", "Komutlar salt-okunur, geçici çalışma alanında yürütülür"],
+			},
+			{
+				title: "Gizlilik ve yerel araçlar",
+				body: "Yalnızca seçtiğin/içe aktardığın metin yapılandırdığın AI sağlayıcısına gönderilir. API anahtarları Obsidian Secret Storage'da tutulur. YouTube altyazı fallback'i için yt-dlp, medya işlemleri için ffmpeg ayarlardan sınanabilir.",
+				items: ["Bağlamsal açıklama yalnızca çift tık/uzun basma veya seçimle açılır", "Eski eklenti verileri yalnızca sen dry-run başlatırsan okunur", "Kaynak eklentiler otomatik silinmez veya kapatılmaz"],
+			},
+		];
+		const page = pages[this.page];
+		this.titleEl.setText(page.title);
+		this.contentEl.createEl("p", { cls: "clp-onboarding-lead", text: page.body });
+		const list = this.contentEl.createEl("ul", { cls: "clp-onboarding-list" });
+		for (const item of page.items) list.createEl("li", { text: item });
+		if (this.page === 1) {
+			const test = this.contentEl.createEl("button", { text: "Codex komutunu sına" });
+			test.addEventListener("click", () => void (async () => {
+				test.disabled = true;
+				test.setText("Sınanıyor…");
+				const result = await probeCodexCommand(this.translation);
+				test.setText(result.available ? `✓ ${result.detail}` : `✗ ${result.detail}`);
+				test.disabled = false;
+			})());
+		}
+		const steps = this.contentEl.createEl("div", { cls: "clp-onboarding-steps", attr: { "aria-label": "Onboarding ilerlemesi" } });
+		pages.forEach((_, index) => steps.createEl("span", { cls: index === this.page ? "is-active" : "" }));
+		const actions = this.contentEl.createEl("div", { cls: "clp-onboarding-actions" });
+		if (this.page > 0) {
+			const back = actions.createEl("button", { text: "Geri" });
+			back.addEventListener("click", () => { this.page--; this.render(); });
+		}
+		const next = actions.createEl("button", {
+			cls: "mod-cta",
+			text: this.page === pages.length - 1 ? "Portal'ı kullan" : "Devam",
+		});
+		next.addEventListener("click", () => void (async () => {
+			if (this.page < pages.length - 1) {
+				this.page++;
+				this.render();
+				return;
+			}
+			next.disabled = true;
+			await this.finish();
+			this.close();
+		})());
+	}
+}
+
+class ClpConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private heading: string,
+		private message: string,
+		private confirmLabel: string,
+		private onConfirm: () => Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.heading);
+		this.contentEl.createEl("p", { text: this.message });
+		const actions = this.contentEl.createEl("div", { cls: "clp-confirm-actions" });
+		const cancel = actions.createEl("button", { text: "Vazgeç" });
+		const confirm = actions.createEl("button", { cls: "mod-cta", text: this.confirmLabel });
+		cancel.addEventListener("click", () => this.close());
+		confirm.addEventListener("click", () => {
+			cancel.disabled = true;
+			confirm.disabled = true;
+			confirm.setText("Uygulanıyor…");
+			void this.onConfirm().finally(() => this.close());
+		});
+	}
+
+	onClose(): void { this.contentEl.empty(); }
+}
+
+class ClpSettingTab extends PluginSettingTab {
+	private migrationPreview: MigrationPreview | null = null;
+	private migrationBusy = false;
+	private diagnostics: string[] | null = null;
+	private diagnosticsBusy = false;
+	private speechVoicesUnsubscribe: (() => void) | null = null;
+
+	constructor(app: App, private plugin: ComprehensibleLearningPortal) {
+		super(app, plugin);
+	}
+
+	/** Web Speech voices are populated asynchronously by Electron/macOS. Keep
+	 *  the setting tab subscribed only while its initial list is empty, then
+	 *  repaint once the system announces the downloaded voices. */
+	private watchSpeechVoices(): void {
+		this.speechVoicesUnsubscribe?.();
+		this.speechVoicesUnsubscribe = null;
+		if (!("speechSynthesis" in window)) return;
+		const synthesis = window.speechSynthesis;
+		const onVoicesChanged = (): void => {
+			synthesis.removeEventListener("voiceschanged", onVoicesChanged);
+			this.speechVoicesUnsubscribe = null;
+			this.display();
+		};
+		synthesis.addEventListener("voiceschanged", onVoicesChanged, { once: true });
+		this.speechVoicesUnsubscribe = () => synthesis.removeEventListener("voiceschanged", onVoicesChanged);
+		// Trigger enumeration in Electron; some versions only populate the list
+		// after getVoices() is called at least once.
+		synthesis.getVoices();
+	}
+
+	/** Reader text size: a "use Obsidian's" switch, plus the slider that appears
+	 *  only once it's off. Repaints its own block rather than calling `display()`
+	 *  on toggle — a full redraw would collapse every expanded provider panel
+	 *  further down the tab. */
+	private renderTextSizeSetting(parent: HTMLElement): void {
+		const block = parent.createEl("div");
+		const paint = (): void => {
+			block.empty();
+			const following = this.plugin.settings.readerFontSize === null;
+
+			new Setting(block)
+				.setName("Use Obsidian's text size")
+				.setDesc("Book text matches Appearance → Font size, so it changes with the rest of the app. Turn this off to set a size for the reader alone.")
+				.addToggle(t => t
+					.setValue(following)
+					.onChange(async (v) => {
+						// Seeded with the size already on screen, so flipping the
+						// switch off changes nothing until the slider moves.
+						this.plugin.settings.readerFontSize = v ? null : appTextSize();
+						await this.plugin.saveSettings();
+						paint();
+					}));
+
+			if (following) return;
+
+			const current = this.plugin.settings.readerFontSize ?? appTextSize();
+			const setting = new Setting(block)
+				.setName("Reader text size")
+				.setDesc("Size of book text in pixels. Affects the reader only — notes and the rest of Obsidian are untouched.")
+				.addExtraButton(b => b
+					.setIcon("rotate-ccw")
+					.setTooltip("Match Obsidian's text size")
+					.onClick(async () => {
+						this.plugin.settings.readerFontSize = appTextSize();
+						await this.plugin.saveSettings();
+						paint();
+					}));
+			// Created between the reset button and the slider so the row reads
+			// [reset] [18] [────●────], the same order as Obsidian's own.
+			const value = setting.controlEl.createEl("span", {
+				cls: "clp-setting-slider-value",
+				text: String(current),
+			});
+			setting.addSlider(s => {
+				s.setLimits(READER_FONT_MIN, READER_FONT_MAX, 1)
+					.setValue(current)
+					// Commit on release, not on every drag tick: each change
+					// repaginates the open book.
+					.setInstant(false)
+					.onChange(async (n) => {
+						this.plugin.settings.readerFontSize = n;
+						await this.plugin.saveSettings();
+					});
+				// The number still tracks the thumb while dragging, so the slider
+				// reads live even though nothing has been committed yet.
+				s.sliderEl.addEventListener("input", () => value.setText(s.sliderEl.value));
+			});
+		};
+		paint();
+	}
+
+	private renderMigrationSection(parent: HTMLElement): void {
+		new Setting(parent).setName("Eski eklentilerden güvenli geçiş").setHeading();
+		parent.createEl("p", {
+			cls: "setting-item-description",
+			text: "Portal eski eklenti verilerini kendiliğinden okumaz. Dry-run düğmesi yalnızca öğrenme kayıtlarını salt-okunur tarar; API anahtarları, promptlar, cache ve diğer ayarlar rapora alınmaz.",
+		});
+		new Setting(parent)
+			.setName("Migration dry-run")
+			.setDesc("Hiçbir dosyayı veya eklenti durumunu değiştirmeden taşınabilecek Vocabulary ve anotasyon kayıtlarını sayar.")
+			.addButton(button => button
+				.setButtonText(this.migrationBusy ? "Taranıyor…" : "Salt-okunur rapor oluştur")
+				.setDisabled(this.migrationBusy || !Platform.isDesktopApp)
+				.onClick(async () => {
+					this.migrationBusy = true;
+					this.display();
+					try {
+						this.migrationPreview = await buildMigrationPreview(this.app);
+						new Notice("Migration dry-run tamamlandı; henüz hiçbir veri değiştirilmedi.");
+					} catch (error) {
+						new Notice(`Migration dry-run başarısız: ${errorMessage(error)}`);
+					} finally {
+						this.migrationBusy = false;
+						this.display();
+					}
+				}));
+
+		const preview = this.migrationPreview;
+		if (preview) {
+			const report = parent.createEl("div", { cls: "clp-migration-report" });
+			const totals = report.createEl("div", { cls: "clp-migration-summary" });
+			totals.createEl("strong", { text: `${preview.vocabulary.length} Vocabulary · ${preview.annotations.length} anotasyon` });
+			totals.createEl("span", { text: `Rapor kimliği: ${preview.fingerprint}` });
+			const list = report.createEl("ul");
+			for (const pluginReport of preview.plugins) {
+				const status = pluginReport.installed
+					? `${pluginReport.vocabulary} kelime, ${pluginReport.annotations} anotasyon`
+					: "data.json bulunamadı";
+				const item = list.createEl("li", { text: `${pluginReport.label}: ${status}` });
+				if (pluginReport.warnings.length) item.createEl("small", { text: ` · ${pluginReport.warnings.join(" · ")}` });
+			}
+			const alreadyApplied = this.plugin.settings.migrationHistory.some(
+				(entry) => entry.fingerprint === preview.fingerprint && entry.verified,
+			);
+			if (alreadyApplied) {
+				report.createEl("p", { cls: "clp-migration-ok", text: "✓ Bu rapor daha önce uygulandı ve veri eşitliği doğrulandı." });
+			} else if (preview.vocabulary.length || preview.annotations.length) {
+				const apply = report.createEl("button", { cls: "mod-cta", text: "Bu raporu içe aktar…" });
+				apply.addEventListener("click", () => {
+					new ClpConfirmModal(
+						this.app,
+						"Eski öğrenme verileri içe aktarılsın mı?",
+						`${preview.vocabulary.length} Vocabulary ve ${preview.annotations.length} anotasyon kaydı Portal'a eklenecek. Kaynak eklentiler silinmeyecek veya devre dışı bırakılmayacak. Aynı rapor tekrar uygulanırsa kayıtlar çoğaltılmaz.`,
+						"İçe aktar ve doğrula",
+						async () => {
+							try {
+								const result = await this.plugin.applyLegacyMigration(preview);
+								new Notice(result.verified
+									? `Göç doğrulandı: ${result.vocabularyImported} Vocabulary, ${result.annotationsImported} anotasyon.`
+									: "Göç uygulandı ancak veri eşitliği doğrulanamadı; eski eklentilere dokunulmadı.");
+							} catch (error) {
+								new Notice(`Göç uygulanamadı: ${errorMessage(error)}`);
+							}
+							this.display();
+						},
+					).open();
+				});
+			} else {
+				report.createEl("p", { text: "Taşınabilir kalıcı Vocabulary veya anotasyon kaydı bulunamadı." });
+			}
+		}
+
+		const latest = this.plugin.settings.migrationHistory[0];
+		if (latest) {
+			parent.createEl("p", {
+				cls: `clp-migration-history ${latest.verified ? "is-verified" : "is-unverified"}`,
+				text: `${latest.verified ? "✓" : "!"} Son uygulama ${new Date(latest.appliedAt).toLocaleString("tr-TR")} · ${latest.vocabularyImported} Vocabulary · ${latest.annotationsImported} anotasyon · ${latest.verified ? "eşitlik doğrulandı" : "doğrulama gerekli"}`,
+			});
+		}
+		parent.createEl("p", {
+			cls: "setting-item-description",
+			text: "Eski eklentileri devre dışı bırakma veya klasörlerini kaldırma bu ekranda otomatik yapılmaz; yalnızca uçtan uca kabul tamamlandıktan ve ayrıca açık onay verildikten sonra yapılacaktır.",
+		});
+	}
+
+	private async runDiagnostics(): Promise<void> {
+		this.diagnosticsBusy = true;
+		this.display();
+		try {
+			const [codex, ytDlp, ffmpeg, whisper] = await Promise.all([
+				probeCodexCommand(this.plugin.settings.translation),
+				probeLocalTool("yt-dlp", this.plugin.settings.youtube.ytDlpCommand),
+				probeLocalTool("ffmpeg", this.plugin.settings.youtube.ffmpegCommand),
+				probeWhisperSetup(this.plugin.settings.youtube.whisperCommand, this.plugin.settings.youtube.whisperModel),
+			]);
+			const pluginManager = (this.app as App & { plugins?: { enabledPlugins?: Set<string> } }).plugins;
+			const enabledLegacy = LEGACY_PLUGIN_SOURCES
+				.filter((source) => pluginManager?.enabledPlugins?.has(source.id))
+				.map((source) => source.label);
+			this.diagnostics = [
+				`Portal ${this.plugin.manifest.version} · Obsidian ${apiVersion} · ${Platform.isDesktopApp ? "desktop" : "mobile"}`,
+				`${codex.available ? "✓" : "✗"} Codex: ${codex.detail}`,
+				`${ytDlp.available ? "✓" : "✗"} yt-dlp: ${ytDlp.detail}`,
+				`${ffmpeg.available ? "✓" : "✗"} ffmpeg: ${ffmpeg.detail}`,
+				`${whisper.available ? "✓" : "✗"} Whisper: ${whisper.detail}`,
+				`Çeviri cache: ${Object.keys(this.plugin.settings.translationCache).length} · Hover cache: ${Object.keys(this.plugin.settings.quickLookupCache).length} · YouTube hikâye cache: ${Object.keys(this.plugin.settings.youtubeStoryCache).length}`,
+				`Import işleri: ${this.plugin.settings.importJobs.length} · Study kayıtları: ${this.plugin.settings.study.vocabulary.length + this.plugin.settings.study.grammar.length + this.plugin.settings.study.mistakes.length + this.plugin.settings.study.shadowing.length}`,
+				enabledLegacy.length
+					? `! Kaynak eklentiler hâlâ etkin: ${enabledLegacy.join(", ")}`
+					: "✓ Kaynak eklenti çakışması görünmüyor",
+			];
+		} finally {
+			this.diagnosticsBusy = false;
+			this.display();
+		}
+	}
+
+	 display(): void {
+		const { containerEl } = this;
+		this.speechVoicesUnsubscribe?.();
+		this.speechVoicesUnsubscribe = null;
+		containerEl.empty();
+		new Setting(containerEl)
+			.setName("Ayar görünümü")
+			.setDesc("Temel görünüm günlük kullanım ayarlarını gösterir; gelişmiş görünüm prompt, göç ve Apple Books araçlarını da açar.")
+			.addDropdown(dropdown => dropdown
+				.addOption("basic", "Temel")
+				.addOption("advanced", "Gelişmiş")
+				.setValue(this.plugin.settings.advancedSettingsVisible ? "advanced" : "basic")
+				.onChange(async value => {
+					this.plugin.settings.advancedSettingsVisible = value === "advanced";
+					await this.plugin.persistSettings();
+					this.display();
+				}))
+			.addButton(button => button.setButtonText("Tanıtımı yeniden aç").onClick(() => this.plugin.openOnboarding()));
+
+		// ── Beta feedback (kept at the top so testers don't miss it) ──────
+		if (FEEDBACK_BETA) {
+			new Setting(containerEl)
+				.setName("Beta geri bildirimi")
+				.setDesc("Eklenti, Obsidian ve işletim sistemi sürümlerini otomatik ekleyerek tarayıcıda anonim geri bildirim formunu açar.")
+				.addButton(b => b
+					.setButtonText("Geri bildirim gönder")
+					.setCta()
+					.onClick(() => {
+						window.open(buildFeedbackUrl(this.plugin.manifest.version), "_blank");
+					}));
+		}
+
+		// ── Reading ──────────────────────────────────────────────────────
+		new Setting(containerEl).setName("Okuma").setHeading();
+		this.renderTextSizeSetting(containerEl);
+		new Setting(containerEl)
+			.setName("EPUB okuma akışı")
+			.setDesc("Yatay sayfalar kitap gibi sayfa çevirir; sürekli dikey mod metni aşağı doğru kaydırır.")
+			.addDropdown(dropdown => dropdown
+				.addOption("paged", "Yatay sayfalar")
+				.addOption("continuous", "Sürekli dikey")
+				.setValue(this.plugin.settings.readerFlow)
+				.onChange(async value => {
+					this.plugin.settings.readerFlow = value as ComprehensibleLearningPortalSettings["readerFlow"];
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl).setName("Çeviri").setHeading();
+		new Setting(containerEl)
+			.setName("Çeviri motoru")
+			.setDesc("Kitap ve YouTube çevirisini burada seçersin. API profilleri aşağıdaki tek sağlayıcı kayıt alanından yönetilir; Codex/OpenCode/pi ise burada kendi komut ve model alanlarını gösterir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("codex", "Codex")
+				.addOption("opencode", "OpenCode (yerel ajan)")
+				.addOption("pi", "pi (yerel ajan)")
+				.addOption("google", "Google Gemini API")
+				.addOption("antigravity", "Google Antigravity Agent")
+				.addOption("openai", "OpenAI API")
+				.addOption("anthropic", "Anthropic API")
+				.addOption("ollama", "Ollama")
+				.setValue(this.plugin.settings.translation.backend)
+				.onChange(async value => {
+					this.plugin.settings.translation.backend = value as TranslationSettings["backend"];
+					if (value === "codex") this.plugin.settings.translation.codexModel = CODEX_LEARNING_MODEL;
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+		new Setting(containerEl)
+			.setName("Kaynak dil")
+			.setDesc("Portalın öğrenme içeriği İngilizcedir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("en", "İngilizce")
+				.setValue(this.plugin.settings.translation.sourceLanguage)
+				.onChange(async value => {
+					this.plugin.settings.translation.sourceLanguage = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Açıklama ve çeviri dili")
+			.setDesc("Çift dilli kitap ve YouTube çevirisinin hedef dili. Hover/Gloss açıklama dili aşağıda ayrıca seçilir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("tr", "Türkçe")
+				.setValue(this.plugin.settings.translation.targetLanguage)
+				.onChange(async value => {
+					this.plugin.settings.translation.targetLanguage = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName("Okuma dili görünümü")
+			.setDesc("Okuyucuda İngilizce, çift dilli veya yalnızca Türkçe görünümü seç.")
+			.addDropdown(dropdown => dropdown
+				.addOption("source", "Yalnızca İngilizce")
+				.addOption("bilingual", "İngilizce + Türkçe")
+				.addOption("target", "Yalnızca Türkçe")
+				.setValue(this.plugin.settings.translation.viewMode)
+				.onChange(async value => {
+					this.plugin.settings.translation.viewMode = value as TranslationSettings["viewMode"];
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName("Çift dilli düzen")
+			.setDesc("Otomatik düzen geniş ekranda yan yana, dar ekranda alt alta gösterir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("auto", "Otomatik")
+				.addOption("horizontal", "Yan yana")
+				.addOption("vertical", "Alt alta")
+				.setValue(this.plugin.settings.translation.bilingualLayout)
+				.onChange(async value => {
+					this.plugin.settings.translation.bilingualLayout = value as TranslationSettings["bilingualLayout"];
+					await this.plugin.saveSettings();
+				}));
+
+		if (this.plugin.settings.translation.backend === "codex") {
+			new Setting(containerEl)
+				.setName("Codex komutu")
+				.setDesc("Boş bırakıldığında Codex otomatik bulunur.")
+				.addText(text => text
+					.setPlaceholder("Otomatik")
+					.setValue(this.plugin.settings.translation.codexCommand)
+					.onChange(async value => {
+						this.plugin.settings.translation.codexCommand = value.trim();
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Codex modeli")
+				.setDesc("Codex seçiliyken İngilizce öğrenme işlemleri için sabittir; yerel Codex varsayılanını kullanmaz.")
+				.addText(text => text
+					.setValue(CODEX_LEARNING_MODEL)
+					.setDisabled(true));
+			new Setting(containerEl)
+				.setName("Codex düşünme düzeyi")
+				.setDesc("Çeviri için none en hızlı ve en düşük maliyetli seçenektir.")
+				.addDropdown(dropdown => dropdown
+					.addOption("none", "none")
+					.addOption("minimal", "minimal")
+					.addOption("low", "low")
+					.addOption("medium", "medium")
+					.addOption("high", "high")
+					.addOption("xhigh", "xhigh")
+					.setValue(this.plugin.settings.translation.reasoningEffort)
+					.onChange(async value => {
+						this.plugin.settings.translation.reasoningEffort = value as TranslationSettings["reasoningEffort"];
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Codex bağlantısını sına")
+				.setDesc("Komutu otomatik bulur ve sürüm bilgisini okur; metin göndermez.")
+				.addButton(button => button.setButtonText("Sına").onClick(async () => {
+					button.setDisabled(true).setButtonText("Sınanıyor…");
+					const result = await probeCodexCommand(this.plugin.settings.translation);
+					button.setDisabled(false).setButtonText("Sına");
+					new Notice(result.available ? `✓ ${result.detail}` : `✗ ${result.detail}`);
+				}));
+		}
+		if (this.plugin.settings.translation.backend === "opencode") {
+			this.renderAgentCliSettings(containerEl, "opencode");
+		}
+		if (this.plugin.settings.translation.backend === "pi") {
+			this.renderAgentCliSettings(containerEl, "pi");
+		}
+		if (["google", "antigravity", "openai", "anthropic", "ollama"].includes(this.plugin.settings.translation.backend)) {
+			this.renderTranslationApiProvider(containerEl);
+		}
+
+		const advanced = containerEl.createEl("details", { cls: "clp-settings-accordion" });
+		advanced.createEl("summary", { cls: "clp-settings-accordion-summary", text: "Gelişmiş çeviri ayarları" });
+		new Setting(advanced)
+			.setName("İşlem zaman aşımı")
+			.setDesc("Her AI çeviri çağrısı için saniye.")
+			.addText(text => text.setValue(String(this.plugin.settings.translation.timeoutSeconds)).onChange(async value => {
+				const seconds = Number.parseInt(value, 10);
+				if (Number.isFinite(seconds)) this.plugin.settings.translation.timeoutSeconds = Math.max(10, seconds);
+				await this.plugin.saveSettings();
+			}));
+		new Setting(advanced)
+			.setName("Toplu çeviri boyutu")
+			.setDesc("Bir AI çağrısındaki yaklaşık kaynak karakter sayısı.")
+			.addText(text => text.setValue(String(this.plugin.settings.translation.batchCharacters)).onChange(async value => {
+				const count = Number.parseInt(value, 10);
+				if (Number.isFinite(count)) this.plugin.settings.translation.batchCharacters = Math.max(2000, count);
+				await this.plugin.saveSettings();
+			}));
+		new Setting(advanced)
+			.setName("Çeviri önbelleği")
+			.setDesc(`${Object.keys(this.plugin.settings.translationCache).length} doğrulanmış paragraf. Kitap çevirileri silinmez.`)
+			.addButton(button => button.setButtonText("Önbelleği temizle").onClick(async () => {
+				this.plugin.settings.translationCache = {};
+				await this.plugin.saveSettings();
+				this.display();
+			}));
+		new Setting(containerEl).setName("EPUB otomasyonu ve depolama").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text: "İçerik ekle ile seçilen EPUB Library/Books altında saklanır, bölüm/paragraf kimlikleri çıkarılır ve çift dilli veri plugin cache'inde hazırlanır. Orijinal EPUB hiçbir aşamada değiştirilmez.",
+		});
+		new Setting(containerEl)
+			.setName("Çift dilli Markdown export klasörü")
+			.setDesc("Reader araç çubuğundaki indirme düğmesi ve komut paleti bu klasöre yazar; export yeniden AI çağrısı yapmaz.")
+			.addText(text => text
+				.setPlaceholder("Library/Exports")
+				.setValue(this.plugin.settings.epubMarkdownExportFolder)
+				.onChange(async value => {
+					this.plugin.settings.epubMarkdownExportFolder = normalizePath(value.trim() || "Library/Exports");
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl).setName("Bağlamsal açıklama & Gloss").setHeading();
+		new Setting(containerEl)
+			.setName("Hızlı bağlamsal açıklama")
+			.setDesc("Çift tık/uzun basma veya seçim araç çubuğuyla bağlamsal anlam, IPA, sözcük türü ve kullanım açıklaması gösterir.")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.quickLookup.enabled)
+				.onChange(async value => {
+					this.plugin.settings.quickLookup.enabled = value;
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+		if (this.plugin.settings.quickLookup.enabled) {
+			new Setting(containerEl)
+				.setName("Bağlamsal açıklama dili")
+				.setDesc("Türkçe destekli öğrenme veya yalnızca İngilizce bağlamdan öğrenme arasında geçiş yapar.")
+				.addDropdown(dropdown => dropdown
+					.addOption("tr", "Türkçe açıklama")
+					.addOption("en", "English definition")
+					.setValue(this.plugin.settings.quickLookup.explanationLanguage)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.explanationLanguage = value as QuickLookupSettings["explanationLanguage"];
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Bağlamsal açıklama tetikleyicisi")
+				.setDesc("Çift tık masaüstünde, basılı tutma mobilde seçilen kelime için bağlamsal kartı açar. Seçim seçeneği yalnızca Gloss araç çubuğunu kullanır.")
+				.addDropdown(dropdown => dropdown
+					.addOption("double-click", "Çift tık / basılı tutma")
+					.addOption("selection", "Yalnızca metin seçimi")
+					.setValue(this.plugin.settings.quickLookup.trigger)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.trigger = value as QuickLookupSettings["trigger"];
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Basılı tutma gecikmesi")
+				.setDesc("Mobilde parmağı bu süre basılı tutunca bağlamsal kart açılır.")
+				.addSlider(slider => slider
+					.setLimits(150, 1500, 50)
+					.setDynamicTooltip()
+					.setValue(this.plugin.settings.quickLookup.delayMs)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.delayMs = value;
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Açıklama kapsamı")
+				.setDesc("Otomatik mod tek sözcüğü kelime, daha uzun seçimi ifade veya cümle olarak yorumlar.")
+				.addDropdown(dropdown => dropdown
+					.addOption("auto", "Otomatik")
+					.addOption("word", "Sözcük")
+					.addOption("sentence", "Cümle")
+					.setValue(this.plugin.settings.quickLookup.scope)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.scope = value as QuickLookupSettings["scope"];
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Kart düzeni")
+				.setDesc("Otomatik düzen dar ekranda dikey, geniş ekranda daha kompakt yatay kart kullanır.")
+				.addDropdown(dropdown => dropdown
+					.addOption("auto", "Otomatik")
+					.addOption("vertical", "Dikey")
+					.addOption("horizontal", "Yatay")
+					.setValue(this.plugin.settings.quickLookup.layout)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.layout = value as QuickLookupSettings["layout"];
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Kart açılınca seslendir")
+				.setDesc("Varsayılan kapalıdır; Dinle düğmesi her zaman kullanılabilir.")
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.quickLookup.autoSpeak)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.autoSpeak = value;
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Kart kapanınca sesi durdur")
+				.addToggle(toggle => toggle
+					.setValue(this.plugin.settings.quickLookup.stopSpeechOnClose)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.stopSpeechOnClose = value;
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("İngilizce ses")
+				.setDesc("Reader, hızlı açıklama ve Shadowing aynı sistem ses dilini kullanır.")
+				.addDropdown(dropdown => dropdown
+					.addOption("en-US", "English (US)")
+					.addOption("en-GB", "English (UK)")
+					.setValue(this.plugin.settings.quickLookup.voiceLocale)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.voiceLocale = value as QuickLookupSettings["voiceLocale"];
+						await this.plugin.saveSettings();
+						this.display();
+					}));
+			const speechVoices = listSpeechVoices(this.plugin.settings.quickLookup.voiceLocale);
+			if (speechVoices.length === 0) this.watchSpeechVoices();
+			const voiceSetting = new Setting(containerEl)
+				.setName("Seslendirme konuşmacısı")
+				.setDesc(speechVoices.length
+					? "Whisper modeli değil, işletim sisteminin Web Speech sesidir. Seçtiğin ses için Ön izleme düğmesini kullanabilirsin."
+					: "macOS sesleri henüz yükleniyor. Ses indirmeyi tamamladıktan sonra Sesleri yenile düğmesine bas veya ayarları yeniden aç.")
+				.addDropdown(dropdown => {
+					dropdown.addOption("", "Otomatik doğal ses");
+					for (const voice of speechVoices) {
+						dropdown.addOption(voice.name, `${voice.name} (${voice.lang})`);
+					}
+					dropdown.setValue(this.plugin.settings.quickLookup.voiceName);
+						dropdown.onChange(async value => {
+						this.plugin.settings.quickLookup.voiceName = value;
+						await this.plugin.saveSettings();
+					});
+				});
+			voiceSetting.addButton(button => button
+				.setButtonText("Sesleri yenile")
+				.setTooltip("macOS Web Speech ses listesini yeniden oku")
+				.onClick(() => {
+					window.speechSynthesis?.getVoices();
+					this.display();
+				}));
+			voiceSetting.addButton(button => button
+				.setButtonText("Ön izleme")
+				.setTooltip("Seçili konuşmacıyla kısa bir İngilizce örnek dinlet")
+				.onClick(() => {
+					speakEnglishText(
+						"This is a short voice preview. Choose the speaker that sounds most natural to you.",
+						this.plugin.settings.quickLookup.voiceLocale,
+						this.plugin.settings.quickLookup.speechRate,
+						this.plugin.settings.quickLookup.voiceName,
+					);
+				}));
+			new Setting(containerEl)
+				.setName("Konuşma hızı")
+				.setDesc("TTS hızı; 1.0 normal sistem hızıdır.")
+				.addSlider(slider => slider
+					.setLimits(0.6, 1.2, 0.05)
+					.setDynamicTooltip()
+					.setValue(this.plugin.settings.quickLookup.speechRate)
+					.onChange(async value => {
+						this.plugin.settings.quickLookup.speechRate = value;
+						await this.plugin.saveSettings();
+					}));
+			new Setting(containerEl)
+				.setName("Hızlı açıklama önbelleği")
+				.setDesc(`${Object.keys(this.plugin.settings.quickLookupCache).length} bağlamsal açıklama.`)
+				.addButton(button => button.setButtonText("Önbelleği temizle").onClick(async () => {
+					this.plugin.settings.quickLookupCache = {};
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+		}
+
+		new Setting(containerEl).setName("Study").setHeading();
+		new Setting(containerEl)
+			.setName("Markdown dışa aktarma yolu")
+			.setDesc("Vocabulary, Grammar, Mistakes ve Shadowing tek okunabilir Markdown dosyasında dışa aktarılır. Yalnızca düğmeye bastığında yazılır.")
+			.addText(text => text
+				.setPlaceholder(DEFAULT_STUDY_PREFERENCES.markdownExportPath)
+				.setValue(this.plugin.settings.studyPreferences.markdownExportPath)
+				.onChange(async value => {
+					this.plugin.settings.studyPreferences.markdownExportPath = value.trim();
+					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button.setButtonText("Şimdi dışa aktar").onClick(async () => {
+				button.setDisabled(true).setButtonText("Yazılıyor…");
+				try {
+					const path = await this.plugin.exportStudyMarkdown();
+					new Notice(`Study verisi dışa aktarıldı: ${path}`);
+				} catch (error) {
+					new Notice(`Study dışa aktarılamadı: ${errorMessage(error)}`);
+				} finally {
+					button.setDisabled(false).setButtonText("Şimdi dışa aktar");
+				}
+			}));
+
+		// ── YouTube ──────────────────────────────────────────────────────
+		new Setting(containerEl).setName("YouTube hikâyeleri").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text: "Tek İçerik ekle işlemi altyazıyı alır, gerçek hikâye paragrafları oluşturur, çevirir ve kütüphaneye kaydeder.",
+		});
+		new Setting(containerEl)
+			.setName("Altyazı dili")
+			.setDesc("Öncelikle bu dildeki altyazı izleri aranır.")
+			.addDropdown(dropdown => dropdown
+				.addOption("en", "English")
+				.addOption("en-US", "English (US)")
+				.addOption("en-GB", "English (UK)")
+				.setValue(this.plugin.settings.youtube.sourceLanguage)
+				.onChange(async value => {
+					this.plugin.settings.youtube.sourceLanguage = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Altyazı önceliği")
+			.setDesc("Manuel altyazı genellikle daha doğrudır; bulunamazsa diğer tür denenir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("manual-first", "Manuel önce")
+				.addOption("automatic-first", "Otomatik önce")
+				.setValue(this.plugin.settings.youtube.captionPreference)
+				.onChange(async value => {
+					this.plugin.settings.youtube.captionPreference = value as YoutubeSettings["captionPreference"];
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Paragraf duraklaması")
+			.setDesc("Adaptif seçenek videonun konuşma hızına göre uzun duraklama eşiğini hesaplar.")
+			.addDropdown(dropdown => dropdown
+				.addOption("adaptive", "Adaptif")
+				.addOption("custom", "Özel eşik")
+				.setValue(this.plugin.settings.youtube.pauseMode)
+				.onChange(async value => {
+					this.plugin.settings.youtube.pauseMode = value as YoutubeSettings["pauseMode"];
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+		if (this.plugin.settings.youtube.pauseMode === "custom") {
+			new Setting(containerEl)
+				.setName("Uzun duraklama eşiği")
+				.setDesc("Saniye; 0.8–10 aralığı.")
+				.addSlider(slider => slider
+					.setLimits(0.8, 10, 0.1)
+					.setValue(this.plugin.settings.youtube.pauseSeconds)
+					.setDynamicTooltip()
+					.onChange(async value => {
+						this.plugin.settings.youtube.pauseSeconds = value;
+						await this.plugin.saveSettings();
+					}));
+		}
+		new Setting(containerEl)
+			.setName("AI konu ve sahne geçişleri")
+			.setDesc("Codex, olası cümle sınırlarının iki yanını bağlam içinde inceler. Seçtiği konu/sahne geçişleri uzun duraklama sınırlarına eklenir; AI kullanılamazsa dilsel işaretlerle devam edilir.")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.youtube.topicTransitions)
+				.onChange(async value => {
+					this.plugin.settings.youtube.topicTransitions = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Otomatik Türkçe çeviri")
+			.setDesc("Kapalıysa yalnızca zaman kodlu İngilizce hikâye oluşturulur.")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.youtube.autoTranslate)
+				.onChange(async value => {
+					this.plugin.settings.youtube.autoTranslate = value;
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("YouTube kütüphane klasörü")
+			.setDesc("Vault içindeki çıktı klasörü. Varsayılan görünür yapı Library/YouTube'dur.")
+			.addText(text => text
+				.setPlaceholder(DEFAULT_YOUTUBE_SETTINGS.outputFolder)
+				.setValue(this.plugin.settings.youtube.outputFolder)
+				.onChange(async value => {
+					this.plugin.settings.youtube.outputFolder = normalizePath(value.trim() || DEFAULT_YOUTUBE_SETTINGS.outputFolder);
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Playlist bağlantıları")
+			.setDesc("Toplu işlem masaüstünde videoları sırayla işler; her tamamlanan video kaydedilir ve sonraki çalıştırmada tamamlanan video kimlikleri atlanır.")
+			.addDropdown(dropdown => dropdown
+				.addOption("selected-video", "Yalnızca seçili video")
+				.addOption("batch", "Tüm playlisti sırayla işle")
+				.addOption("reject", "Playlist bağlantısını reddet")
+				.setValue(this.plugin.settings.youtube.playlistBehavior)
+				.onChange(async value => {
+					this.plugin.settings.youtube.playlistBehavior = value as YoutubeSettings["playlistBehavior"];
+					await this.plugin.saveSettings();
+				}));
+		new Setting(containerEl)
+			.setName("Video kareleri")
+			.setDesc("Manuel mod, etkileşimli oynatıcıda Kare yakala düğmesini gösterir. Kullanıcı düğmeye basmadıkça video indirilmez.")
+			.addDropdown(dropdown => dropdown
+				.addOption("manual", "Yalnızca manuel")
+				.addOption("off", "Kapalı")
+				.setValue(this.plugin.settings.youtube.screenshotMode)
+				.onChange(async value => {
+					this.plugin.settings.youtube.screenshotMode = value as YoutubeSettings["screenshotMode"];
+					await this.plugin.saveSettings();
+				}));
+
+		const youtubeAdvanced = containerEl.createEl("details", { cls: "clp-settings-accordion" });
+		youtubeAdvanced.createEl("summary", { cls: "clp-settings-accordion-summary", text: "YouTube gelişmiş ayarları ve tanılama" });
+		new Setting(youtubeAdvanced)
+			.setName("Altyazı fallback")
+			.setDesc("YouTube sayfasından doğrudan alınamazsa masaüstünde yt-dlp ile manuel/otomatik altyazı aranır.")
+			.addDropdown(dropdown => dropdown
+				.addOption("yt-dlp", "yt-dlp altyazı fallback")
+				.addOption("off", "Kapalı")
+				.setValue(this.plugin.settings.youtube.captionFallback)
+				.onChange(async value => {
+					this.plugin.settings.youtube.captionFallback = value as YoutubeSettings["captionFallback"];
+					await this.plugin.saveSettings();
+				}));
+		new Setting(youtubeAdvanced)
+			.setName("Altyazısız video")
+			.setDesc("Whisper fallback yerel ses indirme/dönüştürme gerektirir. Sor seçeneği her video için açık onay ister; geçici ses işlem sonunda silinir.")
+			.addDropdown(dropdown => dropdown
+				.addOption("ask", "Her videoda sor")
+				.addOption("automatic", "Otomatik yerel Whisper")
+				.addOption("off", "Kapalı")
+				.setValue(this.plugin.settings.youtube.noCaptionFallback)
+				.onChange(async value => {
+					this.plugin.settings.youtube.noCaptionFallback = value as YoutubeSettings["noCaptionFallback"];
+					await this.plugin.saveSettings();
+				}));
+		new Setting(youtubeAdvanced)
+			.setName("yt-dlp komutu")
+			.setDesc("Boş bırakıldığında yaygın kurulum yolları ve PATH taranır.")
+			.addText(text => text
+				.setPlaceholder("Otomatik")
+				.setValue(this.plugin.settings.youtube.ytDlpCommand)
+				.onChange(async value => {
+					this.plugin.settings.youtube.ytDlpCommand = value.trim();
+					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button.setButtonText("Sına").onClick(async () => {
+				button.setDisabled(true).setButtonText("Sınanıyor…");
+				const result = await probeLocalTool("yt-dlp", this.plugin.settings.youtube.ytDlpCommand);
+				button.setDisabled(false).setButtonText("Sına");
+				new Notice(result.available ? `✓ yt-dlp ${result.detail}` : `✗ ${result.detail}`);
+			}));
+		new Setting(youtubeAdvanced)
+			.setName("ffmpeg komutu")
+			.setDesc("Altyazısız videonun sesini Whisper için mono 16 kHz WAV biçimine hazırlar.")
+			.addText(text => text
+				.setPlaceholder("Otomatik")
+				.setValue(this.plugin.settings.youtube.ffmpegCommand)
+				.onChange(async value => {
+					this.plugin.settings.youtube.ffmpegCommand = value.trim();
+					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button.setButtonText("Sına").onClick(async () => {
+				button.setDisabled(true).setButtonText("Sınanıyor…");
+				const result = await probeLocalTool("ffmpeg", this.plugin.settings.youtube.ffmpegCommand);
+				button.setDisabled(false).setButtonText("Sına");
+				new Notice(result.available ? `✓ ffmpeg ${result.detail}` : `✗ ${result.detail}`);
+			}));
+		new Setting(youtubeAdvanced)
+			.setName("Whisper komutu")
+			.setDesc("OpenAI Python whisper veya whisper.cpp whisper-cli. Boş bırakıldığında yaygın yollar ve PATH taranır.")
+			.addText(text => text
+				.setPlaceholder("Otomatik")
+				.setValue(this.plugin.settings.youtube.whisperCommand)
+				.onChange(async value => {
+					this.plugin.settings.youtube.whisperCommand = value.trim();
+					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button.setButtonText("Sına").onClick(async () => {
+				button.setDisabled(true).setButtonText("Sınanıyor…");
+				const result = await probeWhisperSetup(
+					this.plugin.settings.youtube.whisperCommand,
+					this.plugin.settings.youtube.whisperModel,
+				);
+				button.setDisabled(false).setButtonText("Sına");
+				new Notice(result.available ? `✓ Whisper ${result.detail}` : `✗ ${result.detail}`);
+			}));
+		new Setting(youtubeAdvanced)
+			.setName("Whisper modeli")
+			.setDesc("Python Whisper için model adı (ör. base.en); whisper.cpp için tam .bin model dosyası yolu.")
+			.addText(text => text
+				.setPlaceholder("base.en")
+				.setValue(this.plugin.settings.youtube.whisperModel)
+				.onChange(async value => {
+					this.plugin.settings.youtube.whisperModel = value.trim();
+					await this.plugin.saveSettings();
+				}));
+		new Setting(youtubeAdvanced)
+			.setName("YouTube önbelleği ve playlist ilerlemesi")
+			.setDesc(`${Object.keys(this.plugin.settings.youtubeStoryCache).length} hikâye önbelleği, ${Object.keys(this.plugin.settings.youtubePlaylistProgress).length} playlist ilerleme kaydı. Ortak çeviri önbelleği ayrı kalır; bu işlem Library/YouTube notlarını silmez, yalnızca yeniden işlemeyi mümkün kılar.`)
+			.addButton(button => button
+				.setButtonText("YouTube verilerini temizle")
+				.setWarning()
+				.onClick(async () => {
+					if (!window.confirm("YouTube hikâye önbelleği, playlist ilerlemeleri ve YouTube işlem geçmişi temizlensin mi? Library/YouTube notları silinmez.")) return;
+					this.plugin.settings.youtubeStoryCache = {};
+					this.plugin.settings.youtubePlaylistProgress = {};
+					this.plugin.settings.importJobs = this.plugin.settings.importJobs.filter((job) =>
+						job.source !== "youtube" || job.status === "running" || job.status === "queued",
+					);
+					await this.plugin.saveSettings();
+					new Notice("YouTube önbelleği, playlist ilerlemeleri ve işlem geçmişi temizlendi. Notlar korunuyor.");
+					this.display();
+				}));
+
+		new Setting(containerEl)
+			.setName("AI öğrenme özellikleri")
+			.setDesc("Gloss açıklama/inceleme modlarını ve konuşmalar panelini açar. Kapalıyken okuyucu sade modda çalışır; ilk AI sağlayıcısı eklendiğinde otomatik açılır.")
+			.addToggle(t => t
+				.setValue(this.plugin.settings.aiFeaturesEnabled)
+				.onChange(async (v) => {
+					this.plugin.settings.aiFeaturesEnabled = v;
+					await this.plugin.saveSettings();
+				}));
+
+		// ── Providers list ───────────────────────────────────────────────
+		new Setting(containerEl).setName("Sağlayıcı profilleri — çeviri + bağlamsal AI").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text: "Bu tek profil kayıt alanı API anahtarlarını, uç noktaları ve model seçimlerini tutar. Üstteki Çeviri motoru hangi profili çeviri için kullanacağını belirler; Gloss, hızlı bağlam ve konuşmalar aynı profilleri paylaşır.",
+		});
+
+		// ── Add provider (cloud + local, one dropdown) ───────────────────
+		// Local-first: CLP prioritises on-device inference, so LM Studio /
+		// Ollama lead the list and LM Studio is the default selection.
+		let pendingProvider = "lm-studio";
+		new Setting(containerEl)
+			.setName("Sağlayıcı ekle")
+			.setDesc("Yerel seçeneklerde varsayılan OpenAI-uyumlu adresler kullanılır (LM Studio :1234, Ollama :11434). Google Gemini, Anthropic, OpenAI ve OpenRouter API anahtarı gerektirir.")
+			.addDropdown(d => d
+				.addOption("lm-studio", "LM Studio (yerel)")
+				.addOption("ollama", "Ollama (yerel)")
+				.addOption("generic", "OpenAI-uyumlu (yerel)")
+				.addOption("anthropic", "Anthropic")
+				.addOption("openai", "OpenAI")
+				.addOption("google", "Google Gemini")
+				.addOption("openrouter", "OpenRouter")
+				.setValue(pendingProvider)
+				.onChange(v => { pendingProvider = v; }))
+			.addButton(b => b.setButtonText("Ekle").setCta().onClick(() => {
+				switch (pendingProvider) {
+					case "ollama": return this.addProvider("openai-compatible", "ollama");
+					case "generic": return this.addProvider("openai-compatible", "generic");
+					case "anthropic": return this.addProvider("anthropic");
+					case "openai": return this.addProvider("openai");
+					case "google": return this.addProvider("google");
+					case "openrouter": return this.addProvider("openai-compatible", "generic", "openrouter");
+					default: return this.addProvider("openai-compatible", "lm-studio");
+				}
+			}));
+
+		if (this.plugin.settings.aiProviders.length === 0) {
+			containerEl.createEl("div", {
+				cls: "setting-item-description",
+				text: "Ek AI sağlayıcısı yapılandırılmadı. Codex varsayılan olarak çalışır; istersen yukarıdan yerel veya uzak bir sağlayıcı ekleyebilirsin.",
+			});
+		}
+		for (let i = 0; i < this.plugin.settings.aiProviders.length; i++) {
+			this.renderProviderEditor(containerEl, i);
+		}
+
+		// ── Default model ────────────────────────────────────────────────
+		// Sits below the providers list: the natural flow is add a provider
+		// first, then pick which one is the default.
+		new Setting(containerEl).setName("Bağlamsal AI varsayılanı").setHeading();
+		new Setting(containerEl)
+			.setName("Birincil sağlayıcı")
+			.setDesc("Mod için farklı seçim yapılmadıysa yeni AI konuşmalarında kullanılır.")
+			.addDropdown(dd => {
+				dd.addOption("", "(yok)");
+				for (const p of this.plugin.settings.aiProviders) {
+					dd.addOption(p.id, `${p.id} (${p.kind})`);
+				}
+				dd.setValue(this.plugin.settings.aiDefaults.primaryProviderId ?? "");
+				dd.onChange(async (v) => {
+					this.plugin.settings.aiDefaults.primaryProviderId = v || null;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Yanıtları canlı göster")
+			.setDesc(
+				"Yerel sağlayıcılarda (LM Studio, Ollama) AI yanıtını üretilirken parça parça gösterir. Uzak sağlayıcıların yanıtı tamamlandıktan sonra gelebilir."
+				+ (Platform.isMobileApp
+					// Streaming needs a raw fetch; mobile routes through Obsidian's
+					// `requestUrl`, which returns a complete response. A LAN server
+					// can still stream, so this is a caveat, not a hard "no".
+					? " Mobilde yanıtlar çoğunlukla tamamlanmış olarak gelir."
+					: ""))
+			.addToggle(t => t
+				.setValue(this.plugin.settings.streaming)
+				.onChange(async (v) => {
+					this.plugin.settings.streaming = v;
+					await this.plugin.saveSettings();
+				}));
+
+		// Mobile only: there is nothing to defer *to* from a desktop session, and
+		// the automatic case (no provider reachable) needs no setting at all —
+		// this is only for a phone that *could* call out but would rather not.
+		if (Platform.isMobile) {
+			new Setting(containerEl)
+				.setName("AI işlemlerini masaüstüne ertele")
+				.setDesc("AI isteklerini bu cihazdan göndermek yerine eşlik eden nota kuyruğa alır. Masaüstü oturumu kitap açıldığında veya bekleyen AI istekleri komutuyla yanıtlar. Hiçbir sağlayıcı erişilebilir değilse istekler zaten otomatik kuyruğa alınır.")
+				.addToggle(t => t
+					.setValue(this.plugin.settings.deferAiToDesktop)
+					.onChange(async (v) => {
+						this.plugin.settings.deferAiToDesktop = v;
+						await this.plugin.saveSettings();
+					}));
+		}
+
+
+		new Setting(containerEl).setName("Gizlilik, maliyet ve sistem durumu").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description clp-settings-disclosure",
+			text: "Codex veya yapılandırdığın uzak AI sağlayıcısı yalnızca çeviri/açıklama için gönderilen kaynak metni işler; sağlayıcının kendi fiyatlandırması ve veri politikası geçerlidir. Portal API anahtarlarını Obsidian Secret Storage'da tutar. Yerel Ollama/LM Studio seçilirse içerik yapılandırdığın yerel sunucuda kalır. yt-dlp ve ffmpeg yalnızca YouTube içe aktarma gerektiğinde yerel olarak çalıştırılır.",
+		});
+		new Setting(containerEl)
+			.setName("Sistem tanıları")
+			.setDesc("Portal, Obsidian, Codex, yt-dlp, ffmpeg, cache ve iş kuyruğu durumunu tek raporda sınar.")
+			.addButton(button => button
+				.setButtonText(this.diagnosticsBusy ? "Sınanıyor…" : "Tüm tanıları çalıştır")
+				.setDisabled(this.diagnosticsBusy)
+				.onClick(() => void this.runDiagnostics()));
+		if (this.diagnostics) {
+			const diagnostics = containerEl.createEl("pre", { cls: "clp-settings-diagnostics" });
+			diagnostics.setText(this.diagnostics.join("\n"));
+		}
+		const backupSetting = new Setting(containerEl)
+			.setName("Ayarları dışa aktar / geri yükle")
+			.setDesc("İçerik, Study kayıtları, cache ve API anahtarları yedeğe eklenmez. Sağlayıcı profilleri anahtarsız dışa aktarılır; geri yüklemede aynı kimlikteki mevcut secret bağlantısı korunur.")
+			.addButton(button => button.setButtonText("JSON dışa aktar").onClick(() => this.plugin.downloadSettingsBackup()));
+		backupSetting.addButton(button => button.setButtonText("JSON geri yükle…").onClick(() => {
+			const input = document.createElement("input");
+			input.type = "file";
+			input.accept = "application/json,.json";
+			input.addEventListener("change", () => void (async () => {
+				const file = input.files?.[0];
+				if (!file) return;
+				try {
+					await this.plugin.restoreSettingsBackup(file);
+					new Notice("Portal ayarları geri yüklendi. API anahtarları değiştirilmedi.");
+					this.display();
+				} catch (error) {
+					new Notice(`Ayarlar geri yüklenemedi: ${errorMessage(error)}`);
+				}
+			})());
+			input.click();
+		}));
+
+		if (this.plugin.settings.advancedSettingsVisible) {
+			// ── AI system prompts ────────────────────────────────────────────
+			this.renderSystemPromptsSection(containerEl);
+
+			// ── Explicit, reversible legacy migration ───────────────────────
+			this.renderMigrationSection(containerEl);
+
+			// ── Apple Books Import ───────────────────────────────────────────
+			// Desktop-only by nature, not just by policy: the flow shells out to
+			// `zip` and opens an Electron folder dialog, neither of which exists on
+			// mobile. Gate on isDesktopApp (capability), never isMobile — under
+			// `emulateMobile` Node is still present and this must keep working.
+			if (Platform.isDesktopApp) this.renderImportSection(containerEl);
+		}
+	}
+
+	private renderTranslationApiProvider(parent: HTMLElement): void {
+		const backend = this.plugin.settings.translation.backend;
+		const matches = this.plugin.settings.aiProviders.filter(provider =>
+			backend === "google" || backend === "antigravity" ? provider.kind === "google"
+				: backend === "openai" ? provider.kind === "openai"
+					: backend === "anthropic" ? provider.kind === "anthropic"
+						: provider.kind === "openai-compatible" && provider.localRuntime === "ollama");
+		const selected = matches.find(provider => provider.id === this.plugin.settings.translation.apiProviderId)
+			?? matches[0];
+		if (!selected) {
+			const label = backend === "google" ? "Google Gemini"
+				: backend === "antigravity" ? "Google Antigravity"
+				: backend === "openai" ? "OpenAI"
+					: backend === "anthropic" ? "Anthropic" : "Ollama";
+			new Setting(parent)
+				.setName(`${label} profili gerekli`)
+				.setDesc("Bu çeviri sağlayıcısı için henüz bir profil yok. Profil eklendikten sonra API anahtarını ve modeli aşağıdaki AI sağlayıcıları bölümünden düzenleyebilirsin.")
+				.addButton(button => button.setButtonText("Profil ekle").setCta().onClick(async () => {
+					if (backend === "google" || backend === "antigravity") await this.addProvider("google");
+					else if (backend === "openai") await this.addProvider("openai");
+					else if (backend === "anthropic") await this.addProvider("anthropic");
+					else await this.addProvider("openai-compatible", "ollama");
+					this.display();
+				}));
+			return;
+		}
+
+		if (this.plugin.settings.translation.apiProviderId !== selected.id) {
+			this.plugin.settings.translation.apiProviderId = selected.id;
+			void this.plugin.saveSettings();
+		}
+		if (matches.length > 1) {
+			new Setting(parent)
+				.setName("Çeviri sağlayıcı profili")
+				.setDesc("Aynı türde birden fazla profil varsa çeviri ve öğrenme işlemlerinin hangisini kullanacağını seç.")
+				.addDropdown(dropdown => {
+					for (const provider of matches) dropdown.addOption(provider.id, provider.id);
+					dropdown.setValue(selected.id).onChange(async value => {
+						this.plugin.settings.translation.apiProviderId = value;
+						await this.plugin.saveSettings();
+						this.display();
+					});
+				});
+		}
+
+		let modelText: TextComponent | null = null;
+		const isAntigravity = backend === "antigravity";
+		const currentModel = isAntigravity
+			? this.plugin.settings.translation.antigravityModel
+			: selected.defaultModel ?? "";
+		new Setting(parent)
+			.setName(`${selected.id} modeli`)
+			.setDesc(isAntigravity
+				? "Antigravity Agent'ın iç Gemini modelini seç. Gemini 3.7 Flash yalnızca bu ajan yolu üzerinden kullanılabilir."
+				: "Liste düğmesi seçili sağlayıcıdan güncel model kataloğunu otomatik getirir.")
+			.addText(text => {
+				modelText = text;
+				text.setValue(currentModel).setDisabled(isAntigravity);
+				if (!isAntigravity) text.onChange(async value => {
+					selected.defaultModel = value.trim();
+					await this.plugin.saveSettings();
+				});
+			})
+			.addExtraButton(button => button
+				.setIcon("list")
+				.setTooltip(isAntigravity ? "Antigravity modellerini göster" : "Seçili sağlayıcıdaki modelleri getir")
+				.onClick(() => {
+					const onPick = (model: string): void => {
+						if (isAntigravity) {
+							this.plugin.settings.translation.antigravityModel = model as TranslationSettings["antigravityModel"];
+						} else {
+							selected.defaultModel = model;
+						}
+						modelText?.setValue(model);
+						void this.plugin.saveSettings();
+					};
+					if (isAntigravity) {
+						new ClpModelPickerModal(this.app, [
+							"gemini-3.7-flash",
+							"gemini-3.6-flash",
+							"gemini-3.5-flash",
+							"gemini-3.5-flash-lite",
+						], onPick).open();
+					} else {
+						void pickModel(this.app, selected, onPick);
+					}
+				}));
+	}
+
+	private renderAgentCliSettings(parent: HTMLElement, backend: AgentCliBackend): void {
+		const label = backend === "opencode" ? "OpenCode" : "pi";
+		const command = backend === "opencode"
+			? this.plugin.settings.translation.opencodeCommand
+			: this.plugin.settings.translation.piCommand;
+		const model = backend === "opencode"
+			? this.plugin.settings.translation.opencodeModel
+			: this.plugin.settings.translation.piModel;
+		new Setting(parent)
+			.setName(`${label} komutu`)
+			.setDesc("Boş bırakıldığında kurulu komut ortak konumlardan otomatik bulunur.")
+			.addText(text => text
+				.setPlaceholder("Otomatik")
+				.setValue(command)
+				.onChange(async value => {
+					if (backend === "opencode") this.plugin.settings.translation.opencodeCommand = value.trim();
+					else this.plugin.settings.translation.piCommand = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		let modelText: TextComponent | null = null;
+			new Setting(parent)
+			.setName(`${label} sağlayıcı / model`)
+			.setDesc(backend === "opencode"
+				? "OpenCode hesabında kullanılabilen provider/model çiftini seç. Liste komutun canlı kataloğundan gelir."
+				: "pi hesabında kullanılabilen provider/model çiftini seç. Google için örnek: google/gemini-3.5-flash.")
+			.addText(text => {
+				modelText = text;
+				text.setPlaceholder("provider/model").setValue(model).onChange(async value => {
+					if (backend === "opencode") this.plugin.settings.translation.opencodeModel = value.trim();
+					else this.plugin.settings.translation.piModel = value.trim();
+					await this.plugin.saveSettings();
+				});
+			})
+			.addExtraButton(button => button
+				.setIcon("list")
+				.setTooltip("Kurulu sağlayıcılardaki modelleri getir")
+				.onClick(async () => {
+					button.setDisabled(true);
+					const result = await probeAgentCli(backend, this.plugin.settings.translation);
+					button.setDisabled(false);
+					if (!result.available) {
+						new Notice(`✗ ${label}: ${result.detail}`);
+						return;
+					}
+					const officialGemini = backend === "pi"
+						? ["google/gemini-3.6-flash", "google/gemini-3.5-flash", "google/gemini-3.5-flash-lite"]
+						: [];
+					const models = [...new Set([...result.models, ...officialGemini])].sort();
+					if (!models.length) {
+						new Notice(`${label}: kimliği doğrulanmış sağlayıcılarda model bulunamadı.`);
+						return;
+					}
+					new ClpModelPickerModal(this.app, models, picked => {
+						if (backend === "opencode") this.plugin.settings.translation.opencodeModel = picked;
+						else this.plugin.settings.translation.piModel = picked;
+						modelText?.setValue(picked);
+						void this.plugin.saveSettings();
+					}).open();
+				}));
+
+		new Setting(parent)
+			.setName(`${label} düşünme düzeyi`)
+			.setDesc("Model seçiminin yanında provider'ın desteklediği reasoning seviyesini belirler. none en hızlı ayardır; max yalnızca destekleyen modellerde kullanılmalıdır.")
+			.addDropdown(dropdown => dropdown
+				.addOption("none", "none")
+				.addOption("minimal", "minimal")
+				.addOption("low", "low")
+				.addOption("medium", "medium")
+				.addOption("high", "high")
+				.addOption("xhigh", "xhigh")
+				.addOption("max", "max")
+				.setValue(this.plugin.settings.translation.reasoningEffort)
+				.onChange(async value => {
+					this.plugin.settings.translation.reasoningEffort = value as TranslationSettings["reasoningEffort"];
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(parent)
+			.setName(`${label} bağlantısını sına`)
+			.setDesc(backend === "opencode"
+				? "Sürümü ve OpenCode hesabında görünen provider/model kataloğunu okur."
+				: "Sürümü ve pi içinde kimliği doğrulanmış provider/model kataloğunu okur.")
+			.addButton(button => button.setButtonText("Sına").onClick(async () => {
+				button.setDisabled(true).setButtonText("Sınanıyor…");
+				const result = await probeAgentCli(backend, this.plugin.settings.translation);
+				button.setDisabled(false).setButtonText("Sına");
+				new Notice(result.available
+					? `✓ ${label}: ${result.detail} · ${result.models.length} model`
+					: `✗ ${label}: ${result.detail}`);
+			}));
+	}
+
+	private renderProviderEditor(parent: HTMLElement, idx: number): void {
+		const provider = this.plugin.settings.aiProviders[idx];
+		const details = parent.createEl("details", { cls: "clp-settings-provider" });
+		const summary = details.createEl("summary", { cls: "clp-settings-provider-summary" });
+		summary.createSpan({ cls: "clp-settings-provider-name", text: provider.id || "(unnamed)" });
+		const runtimeLabel = provider.localRuntime === "lm-studio" ? " · LM Studio"
+			: provider.localRuntime === "ollama" ? " · Ollama" : "";
+		summary.createSpan({ cls: "clp-settings-provider-kind", text: ` — ${provider.kind}${runtimeLabel}` });
+		const wrap = details;
+
+		new Setting(wrap)
+			.setName("Tanımlayıcı")
+			.setDesc("Model seçicisinde kullanıcıya gösterilen ad.")
+			.addText(t => t.setValue(provider.id).onChange(async v => {
+				provider.id = v;
+				await this.plugin.saveSettings();
+			}));
+
+		if (provider.kind === "openai-compatible") {
+			new Setting(wrap)
+				.setName("Sunucu adresi")
+				.setDesc(Platform.isMobileApp
+					// A phone has no model server of its own, so the only local
+					// provider it can reach is one on the network. Say what that
+					// costs up front — the CORS toggle is server-side and is the
+					// step people get stuck on (Mobile spec, Tier 3).
+					? "Ağındaki model sunucusunun temel adresi; ör. http://192.168.1.20:1234. localhost bu cihazı gösterdiği için çalışmaz. Sunucuda CORS izni de açık olmalıdır. /v1/chat/completions yolu otomatik eklenir."
+					: "Temel adres; ör. LM Studio için http://localhost:1234, Ollama için http://localhost:11434 veya https://openrouter.ai/api. /v1/chat/completions yolu otomatik eklenir.")
+				.addText(t => t.setValue(provider.endpoint ?? "").onChange(async v => {
+					provider.endpoint = v;
+					await this.plugin.saveSettings();
+				}));
+		}
+
+		{
+			// Shown for every kind, including openai-compatible. That kind names
+			// a *wire format*, not a location: OpenRouter, Groq and a hosted vLLM
+			// all speak it behind a key, and the transport has always sent
+			// `Authorization: Bearer` when one is set — only this field was
+			// missing, so those services were unconfigurable for no reason.
+			const optional = provider.kind === "openai-compatible";
+			new Setting(wrap)
+				.setName("API anahtarı")
+				.setDesc(
+					(optional
+						? "İsteğe bağlıdır; OpenRouter/Groq gibi barındırılan servisler ister, yerel sunucular genellikle istemez. "
+						: "")
+					+ "Obsidian'ın şifreli Secret Storage alanında tutulur; eklentinin data.json dosyasına yazılmaz.")
+				.addComponent(el => new SecretComponent(this.app, el)
+					.setValue(provider.apiKeyId ?? "")
+					.onChange(async secretId => {
+						provider.apiKeyId = secretId || undefined;
+						provider.apiKey = secretId
+							? (this.app.secretStorage.getSecret(secretId) ?? undefined)
+							: undefined;
+						await this.plugin.saveSettings();
+					}));
+		}
+
+		// Where the data goes. Stated on any provider that isn't a machine the
+		// user controls — the passage and their own annotation leave the device,
+		// and that is worth one plain sentence rather than a buried assumption.
+		// The training claim is *only* on free models: Anthropic's and OpenAI's
+		// API terms exclude API traffic from training by default, so making the
+		// strong claim everywhere would cry wolf and get the notice ignored.
+		const isRemote = provider.kind !== "openai-compatible"
+			|| !isLocalEndpoint(provider.endpoint);
+		if (isRemote) {
+			const note = wrap.createEl("div", { cls: "setting-item-description clp-settings-privacy" });
+			note.createSpan({
+				text: "Uzak sağlayıcı kullanıldığında seçili pasaj ve açıklaman bu cihazın dışına gönderilir.",
+			});
+			if ((provider.defaultModel ?? "").endsWith(":free")) {
+				note.createEl("br");
+				note.createSpan({
+					text: "Ücretsiz modeller promptları saklayabilir veya eğitimde kullanabilir; sağlayıcının veri politikasını kontrol et.",
+				});
+			}
+		}
+
+		let modelText: TextComponent | null = null;
+		new Setting(wrap)
+			.setName("Varsayılan model")
+			.setDesc("Bu sağlayıcı seçildiğinde konuşma isteklerinde gönderilen model kimliği. Örnek: gpt-4o-mini veya llama-3-8b-instruct.")
+			.addText(t => {
+				modelText = t;
+				t.setValue(provider.defaultModel ?? "").onChange(async v => {
+					provider.defaultModel = v;
+					await this.plugin.saveSettings();
+				});
+			})
+			.addExtraButton(b => b
+				.setIcon("list")
+				.setTooltip("Sunucudaki modelleri göster")
+				.onClick(() => void pickModel(this.app, provider, (model) => {
+					provider.defaultModel = model;
+					modelText?.setValue(model);
+					void this.plugin.saveSettings();
+				})));
+
+		new Setting(wrap)
+			.then(s => s.settingEl.addClass("clp-settings-provider-actions"))
+			.addButton(b => b
+				.setButtonText("Bağlantıyı sına")
+				.onClick(async () => {
+					b.setDisabled(true).setButtonText("Sınanıyor…");
+					const result = await probeProvider(provider);
+					b.setDisabled(false).setButtonText("Bağlantıyı sına");
+					if (result.available) {
+						new Notice(`✓ ${provider.id}: ${result.models.length} model kullanılabilir`);
+					} else {
+						new Notice(`✗ ${provider.id}: ${result.error ?? "erişilemiyor"}`);
+					}
+				}))
+			.addExtraButton(b => b
+				.setIcon("trash-2")
+				.setTooltip("Sağlayıcıyı kaldır")
+				.onClick(async () => {
+					this.plugin.settings.aiProviders.splice(idx, 1);
+					if (this.plugin.settings.aiDefaults.primaryProviderId === provider.id) {
+						// Hand the slot to whoever resolution would have fallen
+						// back to anyway, so the dropdown keeps naming the
+						// provider actually in use. Null only when none is left.
+						this.plugin.settings.aiDefaults.primaryProviderId =
+							this.plugin.settings.aiProviders[0]?.id ?? null;
+					}
+					await this.plugin.saveSettings();
+					this.display();
+				}));
+	}
+
+	private async addProvider(
+		kind: ProviderKind,
+		runtime?: LocalRuntime,
+		preset?: "openrouter",
+	): Promise<void> {
+		const idBase = preset === "openrouter" ? "OpenRouter"
+			: kind === "anthropic" ? "Anthropic"
+			: kind === "openai" ? "OpenAI"
+			: kind === "google" ? "Google Gemini"
+			: runtime === "lm-studio" ? "LM Studio"
+			: runtime === "ollama" ? "Ollama"
+			: "Local";
+		let id = idBase;
+		let n = 2;
+		while (this.plugin.settings.aiProviders.some(p => p.id === id)) {
+			id = `${idBase} ${n++}`;
+		}
+		const provider: AiProvider = { id, kind };
+		const starter = starterModel(kind);
+		if (starter) provider.defaultModel = starter;
+		if (preset === "openrouter") {
+			// Hosted, so none of the local prefills apply — including on mobile,
+			// where this is the *point*: a phone can reach it, and the free model
+			// variants cost nothing to test inference against.
+			provider.localRuntime = "generic";
+			provider.endpoint = "https://openrouter.ai/api";
+			// A free variant so the provider works the moment a key is pasted.
+			// Deliberately not a reasoning model: those spend the mode's token
+			// budget on hidden reasoning and can return no text at all at the
+			// 512 explain-mode ceiling. Free ids do churn, and the "Browse
+			// models" button repopulates this from the live list — which is the
+			// real answer to a stale default.
+			provider.defaultModel = "google/gemma-4-26b-a4b-it:free";
+		} else if (kind === "openai-compatible") {
+			provider.localRuntime = runtime ?? "generic";
+			// Ollama defaults to :11434; LM Studio and a bare OpenAI-compatible
+			// server both default to :1234 (the user can edit either).
+			//
+			// No prefill on a phone: `localhost` there is the phone itself, which
+			// is running no model server, so the default would be a URL that can
+			// never work. The LAN address of a desktop is the only useful value
+			// and only the user knows it — an empty field says that, a wrong
+			// default just fails to connect (Mobile spec, Tier 3).
+			provider.endpoint = Platform.isMobileApp
+				? ""
+				: runtime === "ollama"
+					? "http://localhost:11434"
+					: "http://localhost:1234";
+		}
+		// First provider added flips the AI master switch on, so the full
+		// GlossBar + Conversations surface light up without a separate step.
+		if (this.plugin.settings.aiProviders.length === 0) {
+			this.plugin.settings.aiFeaturesEnabled = true;
+		}
+		this.plugin.settings.aiProviders.push(provider);
+		// ...and becomes the primary if nothing valid holds that slot. Resolution
+		// already falls back to the first provider, so this changes no behaviour
+		// — it stops the dropdown reading "(none)" while an exchange is quietly
+		// being routed to that very provider. Written as "no valid primary"
+		// rather than "first provider" so it also repairs the dangling id left
+		// behind when the primary is deleted.
+		const providers = this.plugin.settings.aiProviders;
+		const defaults = this.plugin.settings.aiDefaults;
+		if (!providers.some((p) => p.id === defaults.primaryProviderId)) {
+			defaults.primaryProviderId = provider.id;
+		}
+		await this.plugin.saveSettings();
+		this.display();
+	}
+
+	// ── AI system prompts ───────────────────────────────────────────────────
+
+	private renderSystemPromptsSection(container: HTMLElement): void {
+		const details = container.createEl("details", { cls: "clp-settings-accordion" });
+		const summary = details.createEl("summary", { cls: "clp-settings-accordion-summary" });
+		summary.createSpan({ text: "AI sistem promptları" });
+
+		details.createEl("p", {
+			cls: "setting-item-description clp-settings-accordion-intro",
+			text: "Her AI Gloss modu için modele gönderilen öğrenme talimatlarıdır. Kitap başlığı için {book} kullanabilirsin; seçili pasaj otomatik eklenir.",
+		});
+
+		const modes: { id: AiPromptMode; label: string; desc: string }[] = [
+			{ id: "explain", label: "Açıkla", desc: "Bağlamsal kelime ve kullanım açıklaması." },
+			{ id: "examine", label: "İncele", desc: "Gramer, yapı ve anlamı ayrıntılı inceleme." },
+			{ id: "exclaim", label: "Tepki ver", desc: "Öğrencinin yorumuna sıcak ve öğretici karşılık." },
+			{ id: "enquiry", label: "Tartış", desc: "Açık uçlu İngilizce öğrenme konuşması." },
+		];
+
+		for (const { id, label, desc } of modes) {
+			let textArea!: TextAreaComponent;
+			const setting = new Setting(details)
+				.setName(label)
+				.setDesc(desc)
+				.addTextArea(t => {
+					textArea = t;
+					t.setValue(this.plugin.settings.systemPrompts[id]);
+					t.inputEl.rows = 5;
+					t.inputEl.addClass("clp-settings-prompt-input");
+					t.onChange(async v => {
+						this.plugin.settings.systemPrompts[id] = v;
+						await this.plugin.saveSettings();
+					});
+				})
+				.addExtraButton(b => b
+					.setIcon("rotate-ccw")
+					.setTooltip("Varsayılana döndür")
+					.onClick(async () => {
+						this.plugin.settings.systemPrompts[id] = DEFAULT_SYSTEM_PROMPTS[id];
+						textArea.setValue(DEFAULT_SYSTEM_PROMPTS[id]);
+						await this.plugin.saveSettings();
+					}));
+			setting.settingEl.addClass("clp-settings-prompt-row");
+		}
+	}
+
+	// ── Apple Books import ──────────────────────────────────────────────────
+
+	private importEntries: ImportEntry[] = [];
+
+	private renderImportSection(container: HTMLElement): void {
+		const section = container.createEl("div", { cls: "clp-settings-import-section" });
+
+		const head = new Setting(section)
+			.setName("Apple Books içe aktarma")
+			.setDesc("Yalnızca Apple Books’un klasör olarak çıkardığı, henüz .epub olmayan kitapları kurtarmak içindir. Normal EPUB dosyaları için üstteki İçerik ekle akışını kullan; bu araç çeviri yapmaz.")
+			.addButton(b => b
+				.setButtonText("EPUB klasörlerini seç…")
+				.setCta()
+				.onClick(async () => {
+					const picked = await this.pickEpubFolders();
+					if (!picked.length) return;
+					this.importEntries = this.validateEpubFolders(picked);
+					if (this.importEntries.length) this.renderImportResults(resultsEl);
+				}));
+		head.settingEl.addClass("clp-settings-import-head");
+
+		const resultsEl = section.createEl("div", { cls: "clp-settings-import-results" });
+	}
+
+	private renderImportResults(container: HTMLElement): void {
+		container.empty();
+		if (this.importEntries.length === 0) {
+			container.createEl("p", {
+				cls: "setting-item-description",
+				text: "EPUB klasörü bulunamadı; seçilen yolu kontrol et.",
+			});
+			return;
+		}
+		container.createEl("p", {
+			cls: "setting-item-description",
+			text: `${this.importEntries.length} kitap bulundu:`,
+		});
+
+		for (const entry of this.importEntries) {
+			const row = container.createEl("div", { cls: "clp-settings-import-entry" });
+			const cb = row.createEl("input");
+			cb.type = "checkbox";
+			cb.checked = entry.checked;
+			cb.addEventListener("change", () => { entry.checked = cb.checked; });
+			row.createSpan({ cls: "clp-settings-import-entry-name", text: entry.name });
+			row.createSpan({ cls: "clp-settings-import-entry-arrow", text: "→" });
+			const nameInput = row.createEl("input");
+			nameInput.type = "text";
+			nameInput.className = "clp-settings-import-entry-rename";
+			nameInput.value = entry.finalName;
+			nameInput.addEventListener("input", () => { entry.finalName = nameInput.value; });
+		}
+
+		const footer = container.createEl("div", { cls: "clp-settings-import-footer" });
+		const statusEl = footer.createEl("div", { cls: "clp-settings-import-status" });
+		const btn = footer.createEl("button", { cls: "mod-cta", text: "Seçilenleri içe aktar" });
+		const onImportClick = async () => {
+			const toImport = this.importEntries.filter(e => e.checked);
+			if (!toImport.length) { new Notice("İçe aktarılacak kitap seçilmedi."); return; }
+			btn.disabled = true;
+			btn.textContent = "İçe aktarılıyor…";
+			const imported = await this.importBooks(toImport, statusEl);
+			btn.textContent = "Seçilenleri içe aktar";
+			btn.disabled = imported > 0;
+		};
+		btn.addEventListener("click", () => void onImportClick());
+	}
+
+	private validateEpubFolders(paths: string[]): ImportEntry[] {
+		/* eslint-disable @typescript-eslint/no-require-imports -- Node builtins must
+		   stay inside the function body: a module-scope import becomes a top-of-bundle
+		   require(), which kills the plugin at load on mobile (no require there at all). */
+		const nodePath = require("path") as typeof import("path");
+		const fs = require("fs") as typeof import("fs");
+		/* eslint-enable @typescript-eslint/no-require-imports -- end of the deliberately
+		   lazy Node requires; normal import rules apply again below. */
+		const results: ImportEntry[] = [];
+		for (const folderPath of paths) {
+			const name = nodePath.basename(folderPath);
+			try {
+				const mimetype = fs.readFileSync(nodePath.join(folderPath, "mimetype"), "utf8").trim();
+				if (mimetype !== "application/epub+zip") {
+					new Notice(`"${name}" atlandı; geçerli bir EPUB klasörü değil.`);
+					continue;
+				}
+			} catch {
+				new Notice(`"${name}" atlandı; mimetype dosyası bulunamadı.`);
+				continue;
+			}
+			results.push({
+				folderPath,
+				name,
+				finalName: name.replace(/\.(epub|book)$/i, "").trim() || name,
+				checked: true,
+			});
+		}
+		return results;
+	}
+
+	private async importBooks(entries: ImportEntry[], statusEl: HTMLElement): Promise<number> {
+		/* eslint-disable @typescript-eslint/no-require-imports -- see validateEpubFolders. */
+		const nodePath = require("path") as typeof import("path");
+		const fs = require("fs") as typeof import("fs");
+		/* eslint-enable @typescript-eslint/no-require-imports -- end of the deliberately
+		   lazy Node requires; normal import rules apply again below. */
+		const adapter = this.plugin.app.vault.adapter;
+		const vaultBase = adapter instanceof FileSystemAdapter ? adapter.getBasePath() : "";
+		const outputDir = nodePath.join(vaultBase, "Library", "Imported");
+		try {
+			fs.mkdirSync(outputDir, { recursive: true });
+		} catch (e) {
+			new Notice(`Çıktı klasörü oluşturulamadı: ${(e as Error).message}`);
+			return 0;
+		}
+
+		statusEl.empty();
+		let imported = 0;
+		for (const entry of entries) {
+			const safe = sanitizeFileName(entry.finalName || entry.name);
+			let outputPath = nodePath.join(outputDir, `${safe}.epub`);
+			let n = 2;
+			while (fs.existsSync(outputPath)) {
+				outputPath = nodePath.join(outputDir, `${safe} ${n++}.epub`);
+			}
+			try {
+				const zip = new JSZip();
+				zip.file("mimetype", fs.readFileSync(nodePath.join(entry.folderPath, "mimetype")), { compression: "STORE" });
+				const addFolder = (absolute: string, relative: string): void => {
+					for (const item of fs.readdirSync(absolute, { withFileTypes: true })) {
+						const childRelative = relative ? `${relative}/${item.name}` : item.name;
+						if (childRelative === "mimetype") continue;
+						const childAbsolute = nodePath.join(absolute, item.name);
+						if (item.isDirectory()) addFolder(childAbsolute, childRelative);
+						else if (item.isFile()) zip.file(childRelative, fs.readFileSync(childAbsolute), { compression: "DEFLATE" });
+					}
+				};
+				addFolder(entry.folderPath, "");
+				const archive = await zip.generateAsync({ type: "nodebuffer", mimeType: "application/epub+zip", platform: "UNIX" });
+				await fs.promises.writeFile(outputPath, archive);
+				imported++;
+			} catch (e) {
+				statusEl.createEl("div", {
+					cls: "clp-settings-import-status-line clp-settings-import-err",
+					text: `✗ ${safe}: ${(e as Error).message?.slice(0, 120) ?? "bilinmeyen hata"}`,
+				});
+			}
+		}
+
+		if (imported > 0) {
+			const ok = statusEl.createEl("div", { cls: "clp-settings-import-status-line clp-settings-import-ok" });
+			setIcon(ok.createSpan({ cls: "clp-settings-import-status-icon" }), "book-check");
+			ok.createSpan({ text: `${imported} kitap içe aktarıldı` });
+			new Notice("İçe aktarma tamamlandı; vault içindeki Library/Imported klasörünü kontrol et.");
+		}
+		return imported;
+	}
+
+	private async pickEpubFolders(): Promise<string[]> {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- Electron's remote dialog is only reachable via require() in Obsidian's renderer.
+			const electron = require("electron") as {
+				remote?: {
+					dialog?: {
+						showOpenDialog: (opts: {
+							properties: string[];
+							filters: { name: string; extensions: string[] }[];
+							title: string;
+						}) => Promise<{ canceled: boolean; filePaths: string[] }>;
+					};
+				};
+			};
+			const dialog = electron.remote?.dialog;
+			if (!dialog) {
+				new Notice("Bu Obsidian sürümünde klasör seçici kullanılamıyor.");
+				return [];
+			}
+			const result = await dialog.showOpenDialog({
+				properties: ["openDirectory", "multiSelections"],
+				filters: [],
+				title: "İçe aktarılacak EPUB klasörlerini seç",
+			});
+			return result.canceled ? [] : result.filePaths;
+		} catch {
+			return [];
+		}
+	}
+}

@@ -1,0 +1,10 @@
+{
+  "id": "comprehensible-learning-portal",
+  "name": "Comprehensible Learning Portal",
+  "version": "0.1.0",
+  "minAppVersion": "1.13.0",
+  "description": "A unified comprehensible-input portal for bilingual EPUB and YouTube reading, contextual translation, vocabulary, and study.",
+  "author": "Bahadır Umut İşçimen",
+  "authorUrl": "https://github.com/bahadirumutiscimen",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Personal plugin settings (positions, provider config) — never publish
+data.json
+
+# macOS
+.DS_Store
+
+# The compiled bundle is kept in the repository so BRAT can install the
+# plugin directly from GitHub on iPhone/iPad. `data.json` remains excluded.
+
+# Local/copyrighted test fixture; keep it out of the public plugin repository.
+fixtures/*.epub
