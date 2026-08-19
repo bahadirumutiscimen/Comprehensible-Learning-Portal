@@ -23,6 +23,20 @@ export interface YoutubeTranscript {
 	segments: YoutubeCaptionSegment[];
 }
 
+/** Caption tracks frequently omit punctuation. Keep the raw transcript
+ * readable even when translation is disabled, and normalize the AI-restored
+ * source before it is packaged into the EPUB. */
+export function normalizeYoutubeEnglishText(text: string): string {
+	let normalized = text.normalize("NFKC").replace(/\s+/g, " ").trim();
+	if (!normalized) return normalized;
+	normalized = normalized
+		.replace(/\s+([,.;!?])/g, "$1")
+		.replace(/([,;!?])(?=\S)/g, "$1 ");
+	if (!/^[A-ZÀ-ÖØ-Þ]/.test(normalized)) normalized = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+	if (!/[.!?…]["'’”)]?$/.test(normalized)) normalized += ".";
+	return normalized;
+}
+
 export interface YoutubeStoryCacheEntry {
 	videoId: string;
 	title: string;
@@ -336,13 +350,15 @@ export function renderYoutubeStoryMarkdown(
 		"",
 	];
 	for (const paragraph of paragraphs) {
-		const translation = translations[paragraph.id]?.translation ?? "";
+		const pair = translations[paragraph.id];
+		const translation = pair?.translation ?? "";
+		const source = normalizeYoutubeEnglishText(pair?.sourceText ?? paragraph.text);
 		lines.push(
 			`<div class="clp-youtube-story-pair" data-pair-id="${paragraph.id}" data-source-hash="${paragraph.sourceHash}">`,
 			"",
 			`[${formatTimestamp(paragraph.start)}](https://www.youtube.com/watch?v=${transcript.videoId}&t=${Math.floor(paragraph.start)}s)`,
 			"",
-			`<div class="clp-youtube-story-source" lang="en">${escapeHtml(paragraph.text)}</div>`,
+			`<div class="clp-youtube-story-source" lang="en">${escapeHtml(source)}</div>`,
 			"",
 			`<div class="clp-youtube-story-translation" lang="tr">${escapeHtml(translation)}</div>`,
 			"",
@@ -368,10 +384,12 @@ export async function renderYoutubeStoryEpub(
 	const paragraphMarkup = paragraphs.map((paragraph) => {
 		const timestamp = formatTimestamp(paragraph.start);
 		const timestampUrl = `${sourceUrl}&t=${Math.floor(paragraph.start)}s`;
-		const translation = translations[paragraph.id]?.translation ?? "";
+		const pair = translations[paragraph.id];
+		const translation = pair?.translation ?? "";
+		const source = normalizeYoutubeEnglishText(pair?.sourceText ?? paragraph.text);
 		return [
 			`<div class="clp-bilingual-pair clp-youtube-book-pair" id="${escapeXml(paragraph.id)}">`,
-			`<p class="clp-bilingual-source" lang="en"><a class="clp-youtube-timestamp" href="${escapeXml(timestampUrl)}">${escapeXml(timestamp)}</a> ${escapeXml(paragraph.text)}</p>`,
+			`<p class="clp-bilingual-source" lang="en"><a class="clp-youtube-timestamp" href="${escapeXml(timestampUrl)}">${escapeXml(timestamp)}</a> ${escapeXml(source)}</p>`,
 			`<p class="clp-bilingual-translation" lang="tr">${escapeXml(translation)}</p>`,
 			"</div>",
 		].join("\n");

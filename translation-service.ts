@@ -14,10 +14,15 @@ export interface TranslationUnit {
 
 export interface TranslationPair extends TranslationUnit {
 	translation: string;
+	/** For spoken YouTube units, the model may restore punctuation in the
+	 * source transcript without changing its words or order. EPUB units keep
+	 * this undefined because their source text is already editorially styled. */
+	sourceText?: string;
 }
 
 export interface TranslationCacheEntry {
 	translation: string;
+	sourceText?: string;
 	createdAt: number;
 	backend: string;
 }
@@ -85,7 +90,11 @@ export function translationCacheKey(
 					? `antigravity:${settings.antigravityModel}`
 		: `${settings.backend}:${settings.apiProviderId}`;
 	const surface = context ? `:${context}` : "";
-	return `translation-v2:${backend}:${settings.sourceLanguage}:${settings.targetLanguage}${surface}:${hash}`;
+	// YouTube source punctuation is part of the translated result. Bump only
+	// that surface so existing EPUB translations remain reusable while stale
+	// YouTube cache entries are regenerated with the corrected English source.
+	const version = context === "youtube" ? "translation-v3" : "translation-v2";
+	return `${version}:${backend}:${settings.sourceLanguage}:${settings.targetLanguage}${surface}:${hash}`;
 }
 
 export interface AgentCliProbeResult {
@@ -183,7 +192,11 @@ export async function translateUnits(
 	for (const unit of units) {
 		const cached = cache[translationCacheKey(settings, unit.sourceHash, context)];
 		if (cached?.translation.trim()) {
-			pairs.set(unit.id, { ...unit, translation: cached.translation.trim() });
+			pairs.set(unit.id, {
+				...unit,
+				translation: cached.translation.trim(),
+				...(context === "youtube" && cached.sourceText?.trim() ? { sourceText: cached.sourceText.trim() } : {}),
+			});
 			cacheHits++;
 		} else {
 			missing.push(unit);
@@ -205,9 +218,11 @@ export async function translateUnits(
 		validateTranslations(batch, result.translations);
 		for (const unit of batch) {
 			const translation = result.translations[unit.id].trim();
-			pairs.set(unit.id, { ...unit, translation });
+			const sourceText = context === "youtube" ? result.sourceTexts[unit.id]?.trim() : undefined;
+			pairs.set(unit.id, { ...unit, translation, ...(sourceText ? { sourceText } : {}) });
 			cache[translationCacheKey(settings, unit.sourceHash, context)] = {
 				translation,
+				...(sourceText ? { sourceText } : {}),
 				createdAt: Date.now(),
 				backend: settings.backend,
 			};
@@ -253,6 +268,7 @@ function buildPrompt(
 			"You are translating a spoken YouTube transcript for an English learner.",
 			"Treat each item as one time-coded reading unit: keep item boundaries, sentence order, and names intact; do not merge or split items.",
 			"Keep the translation natural and add normal Turkish punctuation even when the source captions are unpunctuated.",
+			"Also return source as a punctuation-restored English version: preserve the original words, names, order, and meaning, but add normal capitalization and sentence punctuation where the captions omitted it.",
 		]
 		: [
 			"You are translating literary EPUB reading text for an English learner.",
@@ -263,9 +279,16 @@ function buildPrompt(
 		...surface,
 		`Translate every item from ${settings.sourceLanguage} to ${settings.targetLanguage}.`,
 		"Preserve paragraph meaning, tone, punctuation, names, and emphasis. Do not summarize or split/merge items.",
-		"Return only a valid JSON array. Each item must be {\"id\": string, \"translation\": string} in the same order.",
+		context === "youtube"
+			? "Return only a valid JSON array. Each item must be {\"id\": string, \"source\": string, \"translation\": string} in the same order."
+			: "Return only a valid JSON array. Each item must be {\"id\": string, \"translation\": string} in the same order.",
 		JSON.stringify(units.map(({ id, text }) => ({ id, text }))),
 	].join("\n\n");
+}
+
+interface ParsedTranslationResponse {
+	translations: Record<string, string>;
+	sourceTexts: Record<string, string>;
 }
 
 async function translateWithProvider(
@@ -274,7 +297,7 @@ async function translateWithProvider(
 	provider: AiProvider | null | undefined,
 	signal?: AbortSignal,
 	context?: "epub" | "youtube",
-): Promise<{ translations: Record<string, string>; usage: TokenUsage }> {
+): Promise<ParsedTranslationResponse & { usage: TokenUsage }> {
 	if (!provider?.defaultModel) {
 		throw new Error(`${settings.backend} için kullanılabilir bir AI sağlayıcısı ve model ayarlanmamış.`);
 	}
@@ -285,7 +308,8 @@ async function translateWithProvider(
 		stream: false,
 		signal,
 	});
-	return { translations: parseTranslationResponse(response.content, units), usage: usageFromRaw(response.raw) };
+	const parsed = parseTranslationResponse(response.content, units, context);
+	return { ...parsed, usage: usageFromRaw(response.raw) };
 }
 
 async function translateWithCodex(
@@ -293,9 +317,10 @@ async function translateWithCodex(
 	settings: TranslationSettings,
 	signal?: AbortSignal,
 	context?: "epub" | "youtube",
-): Promise<{ translations: Record<string, string>; usage: TokenUsage }> {
+): Promise<ParsedTranslationResponse & { usage: TokenUsage }> {
 	const result = await runCodexTextPrompt(buildPrompt(units, settings, context), settings, signal);
-	return { translations: parseTranslationResponse(result.content, units), usage: result.usage };
+	const parsed = parseTranslationResponse(result.content, units, context);
+	return { ...parsed, usage: result.usage };
 }
 
 async function translateWithAgentCli(
@@ -303,9 +328,10 @@ async function translateWithAgentCli(
 	settings: TranslationSettings,
 	signal?: AbortSignal,
 	context?: "epub" | "youtube",
-): Promise<{ translations: Record<string, string>; usage: TokenUsage }> {
+): Promise<ParsedTranslationResponse & { usage: TokenUsage }> {
 	const result = await runAgentCliTextPrompt(settings.backend as AgentCliBackend, buildPrompt(units, settings, context), settings, signal);
-	return { translations: parseTranslationResponse(result.content, units), usage: result.usage };
+	const parsed = parseTranslationResponse(result.content, units, context);
+	return { ...parsed, usage: result.usage };
 }
 
 async function translateWithAntigravity(
@@ -313,10 +339,11 @@ async function translateWithAntigravity(
 	settings: TranslationSettings,
 	provider: AiProvider | null | undefined,
 	context?: "epub" | "youtube",
-): Promise<{ translations: Record<string, string>; usage: TokenUsage }> {
+): Promise<ParsedTranslationResponse & { usage: TokenUsage }> {
 	if (!provider) throw new Error("Google Antigravity için Google Gemini sağlayıcı profili ve API anahtarı gerekli.");
 	const response = await chatGoogleAntigravity(provider, settings.antigravityModel, buildPrompt(units, settings, context));
-	return { translations: parseTranslationResponse(response.content, units), usage: usageFromRaw(response.raw) };
+	const parsed = parseTranslationResponse(response.content, units, context);
+	return { ...parsed, usage: usageFromRaw(response.raw) };
 }
 
 /** Run a product-owned learning prompt through the configured translation
@@ -614,7 +641,11 @@ function spawnProcess(
 	});
 }
 
-function parseTranslationResponse(raw: string, units: TranslationUnit[]): Record<string, string> {
+function parseTranslationResponse(
+	raw: string,
+	units: TranslationUnit[],
+	context: "epub" | "youtube" | undefined,
+): ParsedTranslationResponse {
 	const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
 	const start = cleaned.indexOf("[");
 	const end = cleaned.lastIndexOf("]");
@@ -624,15 +655,18 @@ function parseTranslationResponse(raw: string, units: TranslationUnit[]): Record
 	catch { throw new Error("Çeviri yanıtı geçerli JSON değil."); }
 	if (!Array.isArray(value)) throw new Error("Çeviri yanıtı bir dizi değil.");
 	const translations: Record<string, string> = {};
+	const sourceTexts: Record<string, string> = {};
 	for (const item of value) {
 		if (!item || typeof item !== "object") continue;
 		const rawId = (item as { id?: unknown }).id;
 		const id = typeof rawId === "string" ? rawId : "";
 		const translation = (item as { translation?: unknown }).translation;
 		if (id && typeof translation === "string") translations[id] = translation;
+		const source = (item as { source?: unknown }).source;
+		if (context === "youtube" && id && typeof source === "string" && source.trim()) sourceTexts[id] = source;
 	}
 	validateTranslations(units, translations);
-	return translations;
+	return { translations, sourceTexts };
 }
 
 function validateTranslations(units: TranslationUnit[], translations: Record<string, string>): void {
