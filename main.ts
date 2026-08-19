@@ -258,6 +258,25 @@ interface ComprehensibleLearningPortalSettings {
 	epubMarkdownExportFolder: string;
 }
 
+/** Canonical state that belongs to one imported content item.  It lives in a
+ * separate JSON file so a large bilingual book can never make the global
+ * plugin data.json grow without bound.  The shared translation cache remains
+ * global intentionally: it is a reusable, content-addressed cache rather than
+ * the canonical state of a particular book. */
+interface ContentStateFile {
+	version: 1;
+	sourcePath: string;
+	kind: "epub" | "pdf" | "youtube";
+	bilingualBook?: BilingualBookData;
+	bookPosition?: Partial<ReaderPosition>;
+	libraryOverride?: LibraryOverride;
+	updatedAt: number;
+}
+
+const CONTENT_STATE_ROOT = `${LIBRARY_ROOT}/.clp/content`;
+const SHARED_TRANSLATION_CACHE_PATH = `${LIBRARY_ROOT}/.clp/translation-cache.json`;
+const YOUTUBE_CACHE_ROOT = `${LIBRARY_ROOT}/.clp/youtube-cache`;
+
 const DEFAULT_SETTINGS: ComprehensibleLearningPortalSettings = {
 	translation: { ...DEFAULT_TRANSLATION_SETTINGS },
 	quickLookup: { ...DEFAULT_QUICK_LOOKUP_SETTINGS },
@@ -5505,6 +5524,11 @@ export default class ComprehensibleLearningPortal extends Plugin {
 	/** Debounce timer collapsing a burst of vault events (e.g. a folder move) into
 	 *  a single Library re-scan. */
 	private _libraryRefreshTimer: number | null = null;
+	/** Serialized snapshots let persistSettings avoid rewriting unchanged sidecars. */
+	private contentStateSnapshots = new Map<string, string>();
+	private contentStateLoaded = false;
+	private translationCacheSnapshot = "";
+	private youtubeCacheSnapshots = new Map<string, string>();
 
 	/** PDF Gloss manager — desktop only, absent when the platform gate declines.
 	 *  Held so settings changes and the pane command can reach attached PDFs. */
@@ -6173,6 +6197,55 @@ export default class ComprehensibleLearningPortal extends Plugin {
 		}
 		await this.persistSettings();
 		return { deleted };
+	}
+
+	/** Move one or more imported outputs into a Library collection.  Companion
+	 * annotation notes stay in Library/Annotations (Obsidian updates their
+	 * wikilinks during the source rename); all canonical per-content state keys
+	 * move with the source path. */
+	async moveImportedContent(inputs: Array<{ path: string; kind: "epub" | "pdf" | "youtube"; rawTitle: string }>, targetFolder: string): Promise<{ moved: string[] }> {
+		const cleanFolder = normalizePath(targetFolder.trim().replace(/^\/+|\/+$/g, ""));
+		if (!cleanFolder || cleanFolder === LIBRARY_ROOT || !cleanFolder.startsWith(`${LIBRARY_ROOT}/`)) {
+			throw new Error("Hedef klasör Library/ içinde olmalı.");
+		}
+		if (cleanFolder.startsWith(`${LIBRARY_ROOT}/Annotations`) || cleanFolder.startsWith(`${CONTENT_STATE_ROOT}/`)) {
+			throw new Error("Annotations ve dahili durum klasörleri hedef olamaz.");
+		}
+		await this.ensureVaultFolder(cleanFolder);
+		const moved: string[] = [];
+		for (const input of inputs) {
+			const sourcePath = normalizePath(input.path);
+			const candidates = new Set<string>([sourcePath]);
+			const lower = sourcePath.toLowerCase();
+			if (input.kind === "youtube" || lower.startsWith(`${LIBRARY_ROOT.toLowerCase()}/youtube/`)) {
+				const stem = lower.endsWith(".md") || lower.endsWith(".epub") ? sourcePath.replace(/\.(?:md|epub)$/i, "") : sourcePath;
+				for (const ext of [".md", ".epub"]) {
+					if (this.app.vault.getAbstractFileByPath(`${stem}${ext}`)) candidates.add(`${stem}${ext}`);
+				}
+			}
+			for (const candidate of candidates) {
+				const file = this.app.vault.getAbstractFileByPath(candidate);
+				if (!(file instanceof TFile)) continue;
+				const newPath = this.uniqueVaultFilePath(cleanFolder, file.name);
+				await this.app.vault.rename(file, newPath);
+				moved.push(newPath);
+				if (this.settings.bookPositions[candidate]) {
+					this.settings.bookPositions[newPath] = this.settings.bookPositions[candidate];
+					delete this.settings.bookPositions[candidate];
+				}
+				if (this.settings.libraryOverrides[candidate]) {
+					this.settings.libraryOverrides[newPath] = this.settings.libraryOverrides[candidate];
+					delete this.settings.libraryOverrides[candidate];
+				}
+				if (this.settings.bilingualBooks[candidate]) {
+					this.settings.bilingualBooks[newPath] = { ...this.settings.bilingualBooks[candidate], filePath: newPath };
+					delete this.settings.bilingualBooks[candidate];
+				}
+			}
+		}
+		await this.persistSettings();
+		this.refreshLibraryViews();
+		return { moved };
 	}
 
 	async addVocabulary(
@@ -7131,6 +7204,8 @@ export default class ComprehensibleLearningPortal extends Plugin {
 		this.settings.importJobs = Array.isArray(data?.importJobs) ? data.importJobs : [];
 		this.settings.translationCache = data?.translationCache ?? {};
 		this.settings.bilingualBooks = data?.bilingualBooks ?? {};
+		const migratedContentState = await this.loadContentStateFiles(data);
+		if (migratedContentState) needsPersist = true;
 		// Beta-only: re-show the Library feedback hint after every reload/update so
 		// testers are reminded where to report. Reset in-memory on each load (no
 		// persist needed); drop this line together with FEEDBACK_BETA for 1.0.
@@ -7170,6 +7245,150 @@ export default class ComprehensibleLearningPortal extends Plugin {
 		if (needsPersist) await this.persistSettings();
 	}
 
+	private contentStatePath(sourcePath: string): string {
+		return normalizePath(`${CONTENT_STATE_ROOT}/${stableHash(sourcePath)}.json`);
+	}
+
+	private contentKind(sourcePath: string): ContentStateFile["kind"] {
+		if (/\/YouTube\//i.test(sourcePath)) return "youtube";
+		if (/\.pdf$/i.test(sourcePath)) return "pdf";
+		return "epub";
+	}
+
+	/** Load per-content state, migrating the old maps from data.json on first run. */
+	private async loadContentStateFiles(
+		legacyData: Partial<ComprehensibleLearningPortalSettings> | null,
+	): Promise<boolean> {
+		let migrated = false;
+		const sharedCacheFile = this.app.vault.getAbstractFileByPath(SHARED_TRANSLATION_CACHE_PATH);
+		if (sharedCacheFile instanceof TFile) {
+			try {
+				const parsed = JSON.parse(await this.app.vault.read(sharedCacheFile)) as Record<string, TranslationCacheEntry>;
+				// Keep legacy entries while allowing the sidecar to win for keys it
+				// already contains (a crash can leave data.json newer than the file).
+				this.settings.translationCache = { ...this.settings.translationCache, ...parsed };
+				this.translationCacheSnapshot = JSON.stringify(parsed);
+			} catch (error) {
+				console.warn("[ComprehensibleLearningPortal] shared translation cache read failed", error);
+			}
+		}
+		const youtubeFolder = this.app.vault.getAbstractFileByPath(YOUTUBE_CACHE_ROOT);
+		const youtubeChildren = youtubeFolder && "children" in youtubeFolder ? (youtubeFolder as { children: unknown }).children : [];
+		for (const file of Array.isArray(youtubeChildren) ? youtubeChildren : []) {
+			if (!(file instanceof TFile) || file.extension !== "json") continue;
+			try {
+				const parsed = JSON.parse(await this.app.vault.read(file)) as { key?: string; entry?: YoutubeStoryCacheEntry };
+				if (!parsed.key || !parsed.entry) continue;
+				this.settings.youtubeStoryCache[parsed.key] = parsed.entry;
+				this.youtubeCacheSnapshots.set(parsed.key, JSON.stringify(parsed));
+			} catch (error) {
+				console.warn("[ComprehensibleLearningPortal] YouTube cache read failed", file.path, error);
+			}
+		}
+		const folder = this.app.vault.getAbstractFileByPath(CONTENT_STATE_ROOT);
+		const children = folder && "children" in folder ? (folder as { children: unknown }).children : [];
+		const files = Array.isArray(children)
+			? children.filter((child): child is TFile => child instanceof TFile && child.extension === "json")
+			: [];
+		for (const file of files) {
+			try {
+				const record = JSON.parse(await this.app.vault.read(file)) as Partial<ContentStateFile>;
+				if (record.version !== 1 || !record.sourcePath) continue;
+				const path = normalizePath(record.sourcePath);
+				if (record.bilingualBook) this.settings.bilingualBooks[path] = record.bilingualBook;
+				if (record.bookPosition) this.settings.bookPositions[path] = record.bookPosition;
+				if (record.libraryOverride) this.settings.libraryOverrides[path] = record.libraryOverride;
+				this.contentStateSnapshots.set(path, JSON.stringify(record));
+			} catch (error) {
+				console.warn("[ComprehensibleLearningPortal] content state read failed", file.path, error);
+			}
+		}
+		const legacyBooks = legacyData?.bilingualBooks ?? {};
+		const legacyPositions = legacyData?.bookPositions ?? {};
+		const legacyOverrides = legacyData?.libraryOverrides ?? {};
+		const legacyPaths = new Set([...Object.keys(legacyBooks), ...Object.keys(legacyPositions), ...Object.keys(legacyOverrides)]);
+		if (legacyPaths.size) migrated = true;
+		if (legacyData?.translationCache && Object.keys(legacyData.translationCache).length) migrated = true;
+		if (legacyData?.youtubeStoryCache && Object.keys(legacyData.youtubeStoryCache).length) migrated = true;
+		this.contentStateLoaded = true;
+		return migrated;
+	}
+
+	private async persistTranslationCache(): Promise<void> {
+		if (!this.contentStateLoaded) return;
+		const serialized = JSON.stringify(this.settings.translationCache);
+		if (serialized === this.translationCacheSnapshot) return;
+		await this.ensureVaultFolder(`${LIBRARY_ROOT}/.clp`);
+		const existing = this.app.vault.getAbstractFileByPath(SHARED_TRANSLATION_CACHE_PATH);
+		if (existing instanceof TFile) await this.app.vault.modify(existing, serialized);
+		else await this.app.vault.create(SHARED_TRANSLATION_CACHE_PATH, serialized);
+		this.translationCacheSnapshot = serialized;
+	}
+
+	private async persistYoutubeStoryCache(): Promise<void> {
+		if (!this.contentStateLoaded) return;
+		const keys = new Set(Object.keys(this.settings.youtubeStoryCache));
+		if (keys.size) await this.ensureVaultFolder(YOUTUBE_CACHE_ROOT);
+		for (const key of keys) {
+			const record = { key, entry: this.settings.youtubeStoryCache[key] };
+			const serialized = JSON.stringify(record);
+			if (this.youtubeCacheSnapshots.get(key) === serialized) continue;
+			const path = normalizePath(`${YOUTUBE_CACHE_ROOT}/${stableHash(key)}.json`);
+			const existing = this.app.vault.getAbstractFileByPath(path);
+			if (existing instanceof TFile) await this.app.vault.modify(existing, serialized);
+			else await this.app.vault.create(path, serialized);
+			this.youtubeCacheSnapshots.set(key, serialized);
+		}
+		const folder = this.app.vault.getAbstractFileByPath(YOUTUBE_CACHE_ROOT);
+		const children = folder && "children" in folder ? (folder as { children: unknown }).children : [];
+		const activeFiles = new Set([...keys].map((key) => normalizePath(`${YOUTUBE_CACHE_ROOT}/${stableHash(key)}.json`)));
+		for (const child of Array.isArray(children) ? children : []) {
+			if (child instanceof TFile && child.extension === "json" && !activeFiles.has(child.path)) await this.app.vault.delete(child);
+		}
+	}
+
+	/** Persist canonical per-content state in one sidecar JSON per source path. */
+	private async persistContentStates(): Promise<void> {
+		if (!this.contentStateLoaded) return;
+		const paths = new Set([
+			...Object.keys(this.settings.bilingualBooks),
+			...Object.keys(this.settings.bookPositions),
+			...Object.keys(this.settings.libraryOverrides),
+		]);
+		if (paths.size) await this.ensureVaultFolder(CONTENT_STATE_ROOT);
+		for (const sourcePath of paths) {
+			const record: ContentStateFile = {
+				version: 1,
+				sourcePath,
+				kind: this.contentKind(sourcePath),
+				bilingualBook: this.settings.bilingualBooks[sourcePath],
+				bookPosition: this.settings.bookPositions[sourcePath],
+				libraryOverride: this.settings.libraryOverrides[sourcePath],
+				// The file is a state snapshot; a volatile timestamp would defeat the
+				// unchanged-snapshot check and rewrite every book on every save.
+				updatedAt: 0,
+			};
+			const serialized = JSON.stringify(record, null, 2);
+			if (this.contentStateSnapshots.get(sourcePath) === serialized) continue;
+			const path = this.contentStatePath(sourcePath);
+			const existing = this.app.vault.getAbstractFileByPath(path);
+			if (existing instanceof TFile) await this.app.vault.modify(existing, serialized);
+			else await this.app.vault.create(path, serialized);
+			this.contentStateSnapshots.set(sourcePath, serialized);
+		}
+		// Remove sidecars whose content was deleted. This also cleans state after a
+		// bulk delete without touching Study or the shared translation cache.
+		const folder = this.app.vault.getAbstractFileByPath(CONTENT_STATE_ROOT);
+		if (folder && "children" in folder) {
+			const children = (folder as { children: unknown }).children;
+			const activeFiles = new Set([...paths].map((p) => this.contentStatePath(p)));
+			for (const child of Array.isArray(children) ? children : []) {
+				if (!(child instanceof TFile) || child.extension !== "json" || activeFiles.has(child.path)) continue;
+				await this.app.vault.delete(child);
+			}
+		}
+	}
+
 	/** Move any legacy plaintext API keys out of data.json and into Obsidian's
 	 *  encrypted secret storage, then resolve every provider's runtime
 	 *  `apiKey` from storage. Returns true if a migration write occurred. */
@@ -7197,16 +7416,30 @@ export default class ComprehensibleLearningPortal extends Plugin {
 
 	/** Write settings to disk with resolved API keys stripped — only the
 	 *  `apiKeyId` reference is persisted, never the key itself. */
-	persistSettings(): Promise<void> {
-		const data: ComprehensibleLearningPortalSettings = {
-			...this.settings,
+	async persistSettings(): Promise<void> {
+		const {
+			bilingualBooks: _books,
+			bookPositions: _positions,
+			libraryOverrides: _overrides,
+			translationCache: _translationCache,
+			youtubeStoryCache: _youtubeStoryCache,
+			...globalSettings
+		} = this.settings;
+		const data = {
+			...globalSettings,
 			aiProviders: this.settings.aiProviders.map((p) => {
 				const copy = { ...p };
 				delete copy.apiKey;
 				return copy;
 			}),
 		};
-		return this.saveData(data);
+		// Write sidecars first. During the one-time migration this ordering means a
+		// crash cannot remove the legacy maps from data.json before their new files
+		// have been safely created.
+		await this.persistContentStates();
+		await this.persistTranslationCache();
+		await this.persistYoutubeStoryCache();
+		await this.saveData(data);
 	}
 
 	async saveSettings(): Promise<void> {

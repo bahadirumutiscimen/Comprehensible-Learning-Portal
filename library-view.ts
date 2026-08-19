@@ -68,6 +68,10 @@ export class LibraryView extends ItemView {
 	 *  would otherwise snap the pill mid-slide). */
 	private tabIndicatorAnimating = false;
 	private tabIndicatorAnimTimer: number | null = null;
+	/** Multi-select mode is intentionally ephemeral; the selected paths are
+	 *  cleared after a bulk operation or when the view is closed. */
+	private selectionMode = false;
+	private selectedPaths = new Set<string>();
 
 	constructor(leaf: WorkspaceLeaf, private plugin: ComprehensibleLearningPortal) {
 		super(leaf);
@@ -254,6 +258,16 @@ export class LibraryView extends ItemView {
 
 		this.render3cToggle(strip);
 
+		const selectBtn = this.iconButton(strip, this.selectionMode ? "x" : "check-square", this.selectionMode ? "Toplu seçimi kapat" : "Toplu yönet");
+		selectBtn.addClass("clp-lib-select-btn");
+		selectBtn.toggleClass("clp-lib-select-btn-active", this.selectionMode);
+		this.registerDomEvent(selectBtn, "click", () => {
+			this.selectionMode = !this.selectionMode;
+			if (!this.selectionMode) this.selectedPaths.clear();
+			this.paintStrip();
+			this.paintBody();
+		});
+
 		const addBook = this.iconButton(strip, "plus-circle", "İçerik ekle");
 		this.registerDomEvent(addBook, "click", () => this.plugin.openContentImportModal());
 
@@ -263,6 +277,33 @@ export class LibraryView extends ItemView {
 		this.registerDomEvent(settings, "click", () => this.openSettings());
 
 		this.positionTabIndicator(false);
+		this.paintBulkActions(strip);
+	}
+
+	private paintBulkActions(strip: HTMLElement): void {
+		if (!this.selectionMode) return;
+		const actions = strip.createEl("div", { cls: "clp-lib-bulk-actions" });
+		const count = actions.createEl("span", { cls: "clp-lib-bulk-count", text: `${this.selectedPaths.size} seçili` });
+		const visible = this.books.filter((book) => !this.activeCollection || book.collection === this.activeCollection);
+		const selectAll = actions.createEl("button", { cls: "clp-lib-bulk-btn", text: "Tümünü seç" });
+		this.registerDomEvent(selectAll, "click", () => {
+			for (const book of visible) this.selectedPaths.add(book.path);
+			this.paintStrip();
+			this.paintBody();
+		});
+		const clear = actions.createEl("button", { cls: "clp-lib-bulk-btn", text: "Temizle" });
+		this.registerDomEvent(clear, "click", () => {
+			this.selectedPaths.clear();
+			this.paintStrip();
+			this.paintBody();
+		});
+		const del = actions.createEl("button", { cls: "clp-lib-bulk-btn clp-lib-bulk-danger", text: "Sil" });
+		del.disabled = this.selectedPaths.size === 0;
+		this.registerDomEvent(del, "click", () => void this.bulkDelete());
+		const move = actions.createEl("button", { cls: "clp-lib-bulk-btn", text: "Klasöre taşı" });
+		move.disabled = this.selectedPaths.size === 0;
+		this.registerDomEvent(move, "click", () => this.openBulkMove());
+		count.setText(`${this.selectedPaths.size} seçili`);
 	}
 
 	/** One persistent element: collapsed it's an icon button; open it grows into a
@@ -698,6 +739,20 @@ export class LibraryView extends ItemView {
 		card.setAttribute("role", "button");
 		card.dataset.path = book.path;
 		card.tabIndex = 0;
+		card.toggleClass("clp-lib-card-selected", this.selectedPaths.has(book.path));
+		if (this.selectionMode) {
+			const check = card.createEl("input", { cls: "clp-lib-card-check" });
+			check.type = "checkbox";
+			check.checked = this.selectedPaths.has(book.path);
+			check.ariaLabel = `${book.title} seç`;
+			this.registerDomEvent(check, "click", (e: MouseEvent) => e.stopPropagation());
+			this.registerDomEvent(check, "change", () => {
+				if (check.checked) this.selectedPaths.add(book.path);
+				else this.selectedPaths.delete(book.path);
+				card.toggleClass("clp-lib-card-selected", check.checked);
+				this.stripEl?.querySelector<HTMLElement>(".clp-lib-bulk-count")?.setText(`${this.selectedPaths.size} seçili`);
+			});
+		}
 
 		const head = card.createEl("div", { cls: "clp-lib-card-head" });
 		head.createEl("div", { cls: "clp-lib-card-title", text: book.title });
@@ -764,7 +819,16 @@ export class LibraryView extends ItemView {
 			marks.createEl("span", { text: String(book.marks) });
 		}
 
-		const open = () => void this.plugin.openBookInNewTab(book.path);
+		const open = () => {
+			if (this.selectionMode) {
+				if (this.selectedPaths.has(book.path)) this.selectedPaths.delete(book.path);
+				else this.selectedPaths.add(book.path);
+				this.paintBody();
+				this.stripEl?.querySelector<HTMLElement>(".clp-lib-bulk-count")?.setText(`${this.selectedPaths.size} seçili`);
+				return;
+			}
+			void this.plugin.openBookInNewTab(book.path);
+		};
 		this.registerDomEvent(card, "click", open);
 		this.registerDomEvent(card, "keydown", (e: KeyboardEvent) => {
 			if (e.key === "Enter" || e.key === " ") {
@@ -830,6 +894,53 @@ export class LibraryView extends ItemView {
 		} catch (error) {
 			new Notice(`İçerik silinemedi: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private async bulkDelete(): Promise<void> {
+		const books = this.books.filter((book) => this.selectedPaths.has(book.path));
+		if (!books.length) return;
+		const confirmed = window.confirm(
+			`${books.length} içerik silinsin mi?\n\n` +
+			"Seçilen EPUB/PDF/YouTube çıktıları ve varsa bağlı YouTube eş dosyaları silinecek. Study kayıtları ve genel çeviri önbelleği korunur.",
+		);
+		if (!confirmed) return;
+		let deleted = 0;
+		try {
+			for (const book of books) {
+				const result = await this.plugin.deleteImportedContent({
+					path: book.path,
+					kind: book.kind,
+					rawTitle: book.rawTitle,
+					hasCompanion: book.hasCompanion,
+				});
+				deleted += result.deleted.length;
+			}
+			this.selectedPaths.clear();
+			this.selectionMode = false;
+			new Notice(`${books.length} içerik silindi (${deleted} dosya).`);
+			await this.refresh();
+		} catch (error) {
+			new Notice(`Toplu silme tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private openBulkMove(): void {
+		const books = this.books.filter((book) => this.selectedPaths.has(book.path));
+		if (!books.length) return;
+		new MoveContentModal(this.app, async (folder) => {
+			try {
+				const result = await this.plugin.moveImportedContent(
+					books.map((book) => ({ path: book.path, kind: book.kind, rawTitle: book.rawTitle })),
+					folder,
+				);
+				this.selectedPaths.clear();
+				this.selectionMode = false;
+				new Notice(`${result.moved.length} dosya taşındı.`);
+				await this.refresh();
+			} catch (error) {
+				new Notice(`Toplu taşıma tamamlanamadı: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}).open();
 	}
 
 	/** Write (or clear) the per-book override. A field is stored only when it
@@ -981,6 +1092,46 @@ class FolderNameModal extends Modal {
 		new Setting(contentEl)
 			.addButton((b) => b.setButtonText("İptal").onClick(() => this.close()))
 			.addButton((b) => b.setButtonText("Oluştur").setCta().onClick(() => void submit()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** Destination picker for the Library's multi-select move action. */
+class MoveContentModal extends Modal {
+	private value = "Library/";
+
+	constructor(app: App, private onSubmit: (folder: string) => void | Promise<void>) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.setTitle("İçerikleri klasöre taşı");
+		contentEl.createEl("p", {
+			cls: "clp-lib-edit-note",
+			text: "Library/ içinde mevcut veya yeni bir klasör yazın. Anotasyon notları Library/Annotations altında korunur.",
+		});
+		const submit = async () => {
+			if (!this.value.trim()) return;
+			this.close();
+			await this.onSubmit(this.value);
+		};
+		new Setting(contentEl).setName("Hedef klasör").addText((t) => {
+			t.setValue(this.value).setPlaceholder("Library/Stories").onChange((v) => (this.value = v));
+			t.inputEl.addEventListener("keydown", (e) => {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					void submit();
+				}
+			});
+			window.setTimeout(() => t.inputEl.focus(), 0);
+		});
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("İptal").onClick(() => this.close()))
+			.addButton((b) => b.setButtonText("Taşı").setCta().onClick(() => void submit()));
 	}
 
 	onClose(): void {

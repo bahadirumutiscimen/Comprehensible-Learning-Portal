@@ -5210,6 +5210,65 @@ body.is-mobile .clp-highlights-item-delete::after {
 	color: inherit !important;
 }
 
+.clp-lib-select-btn-active {
+	border-color: var(--primary) !important;
+	color: var(--primary) !important;
+}
+
+.clp-lib-bulk-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 0 0 auto;
+}
+
+.clp-lib-bulk-count {
+	font-family: var(--font-mono);
+	font-size: 11px;
+	color: var(--muted-foreground);
+	white-space: nowrap;
+}
+
+.clp-lib-bulk-btn {
+	padding: 5px 9px !important;
+	border: 1px solid var(--border) !important;
+	border-radius: var(--radius-pill) !important;
+	background: var(--popover) !important;
+	box-shadow: none !important;
+	color: var(--foreground);
+	font-size: 11px;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.clp-lib-bulk-btn:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+
+.clp-lib-bulk-danger {
+	color: var(--text-error) !important;
+}
+
+.clp-lib-card-selected {
+	border-color: var(--primary) !important;
+	box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+.clp-lib-card-check {
+	position: absolute;
+	top: 16px;
+	left: 16px;
+	z-index: 2;
+	width: 18px;
+	height: 18px;
+	accent-color: var(--primary);
+}
+
+.clp-lib-card:has(.clp-lib-card-check) .clp-lib-card-head {
+	padding-left: 28px;
+}
+
 /* 3C-mode toggle: the icon-button shell, but the 3C logo path inherits the
    button colour (it has no fill of its own). Active = 3C on → Dawn/--primary. */
 .clp-lib-3c-btn svg {
@@ -5729,10 +5788,19 @@ body.is-mobile .clp-root.clp-library {
 	   the buttons and the line never appeared once the list had moved. */
 	.clp-lib-strip {
 		position: relative;
+		flex-wrap: wrap;
 		margin: 0 7px;
 		gap: 6px;
 		padding-bottom: 17px;
 		border-bottom: none;
+	}
+
+	.clp-lib-bulk-actions {
+		order: 10;
+		flex: 1 0 100%;
+		justify-content: flex-end;
+		overflow-x: auto;
+		padding-top: 4px;
 	}
 
 	.clp-lib-strip::after {
