@@ -7204,8 +7204,16 @@ export default class ComprehensibleLearningPortal extends Plugin {
 		this.settings.importJobs = Array.isArray(data?.importJobs) ? data.importJobs : [];
 		this.settings.translationCache = data?.translationCache ?? {};
 		this.settings.bilingualBooks = data?.bilingualBooks ?? {};
-		const migratedContentState = await this.loadContentStateFiles(data);
-		if (migratedContentState) needsPersist = true;
+		try {
+			const migratedContentState = await this.loadContentStateFiles(data);
+			if (migratedContentState) needsPersist = true;
+		} catch (error) {
+			// A synced/read-only vault must not prevent the entire plugin from loading.
+			// Keep the legacy maps in memory and let persistSettings retain them in
+			// data.json until sidecar storage becomes available again.
+			this.contentStateLoaded = false;
+			console.error("[ComprehensibleLearningPortal] content-state migration skipped", error);
+		}
 		// Beta-only: re-show the Library feedback hint after every reload/update so
 		// testers are reminded where to report. Reset in-memory on each load (no
 		// persist needed); drop this line together with FEEDBACK_BETA for 1.0.
@@ -7417,29 +7425,43 @@ export default class ComprehensibleLearningPortal extends Plugin {
 	/** Write settings to disk with resolved API keys stripped — only the
 	 *  `apiKeyId` reference is persisted, never the key itself. */
 	async persistSettings(): Promise<void> {
-		const {
-			bilingualBooks: _books,
-			bookPositions: _positions,
-			libraryOverrides: _overrides,
-			translationCache: _translationCache,
-			youtubeStoryCache: _youtubeStoryCache,
-			...globalSettings
-		} = this.settings;
-		const data = {
-			...globalSettings,
+		let sidecarsReady = this.contentStateLoaded;
+		if (sidecarsReady) {
+			try {
+				// Write sidecars first. During the one-time migration this ordering means a
+				// crash cannot remove the legacy maps from data.json before their new files
+				// have been safely created.
+				await this.persistContentStates();
+				await this.persistTranslationCache();
+				await this.persistYoutubeStoryCache();
+			} catch (error) {
+				sidecarsReady = false;
+				this.contentStateLoaded = false;
+				console.error("[ComprehensibleLearningPortal] sidecar persistence failed; retaining data.json state", error);
+			}
+		}
+		const data = sidecarsReady
+			? (() => {
+				const {
+					bilingualBooks: _books,
+					bookPositions: _positions,
+					libraryOverrides: _overrides,
+					translationCache: _translationCache,
+					youtubeStoryCache: _youtubeStoryCache,
+					...globalSettings
+				} = this.settings;
+				return globalSettings;
+			})()
+			: this.settings;
+		const sanitizedData = {
+			...data,
 			aiProviders: this.settings.aiProviders.map((p) => {
 				const copy = { ...p };
 				delete copy.apiKey;
 				return copy;
 			}),
 		};
-		// Write sidecars first. During the one-time migration this ordering means a
-		// crash cannot remove the legacy maps from data.json before their new files
-		// have been safely created.
-		await this.persistContentStates();
-		await this.persistTranslationCache();
-		await this.persistYoutubeStoryCache();
-		await this.saveData(data);
+		await this.saveData(sanitizedData);
 	}
 
 	async saveSettings(): Promise<void> {
