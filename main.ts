@@ -2620,7 +2620,24 @@ export class ReaderView extends ItemView {
 	private getSpreadCountForContent(content: HTMLElement, pageWidth: number, gap: number): number {
 		const stride = pageWidth + gap;
 		if (stride <= 0) return 1;
-		return Math.max(1, Math.ceil(content.scrollWidth / stride));
+		// Chromium/WebKit report the scrollWidth of a single multicol column for
+		// some dynamically-generated EPUBs (notably the one-spine YouTube EPUB),
+		// even though the text has fragmented into several columns. Measure the
+		// actual range ink as a fallback so those stories do not appear as 1/1.
+		let extent = content.scrollWidth;
+		try {
+			const range = document.createRange();
+			range.selectNodeContents(content);
+			const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+			if (rects.length) {
+				const left = Math.min(...rects.map((rect) => rect.left));
+				const right = Math.max(...rects.map((rect) => rect.right));
+				extent = Math.max(extent, right - left);
+			}
+		} catch {
+			// scrollWidth remains a valid fallback for engines without range geometry.
+		}
+		return Math.max(1, Math.ceil(extent / stride));
 	}
 
 	private getColumnCountForContent(content: HTMLElement, colWidth: number): number {
