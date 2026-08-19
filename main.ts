@@ -2869,6 +2869,18 @@ export class ReaderView extends ItemView {
 		this.currentSpread = 0;
 	}
 
+	/** Continuous flow has no CSS columns, but a long single-spine YouTube story
+	 *  still needs a useful reading counter. Treat each viewport of scrollable
+	 *  content as a virtual page for the footer/mobile progress indicator. */
+	private getContinuousPageInfo(): { page: number; total: number } {
+		if (!this.spreadEl) return { page: 1, total: 1 };
+		const viewport = Math.max(1, this.spreadEl.clientHeight);
+		const contentHeight = Math.max(viewport, this.spreadEl.scrollHeight);
+		const total = Math.max(1, Math.ceil(contentHeight / viewport));
+		const page = Math.max(1, Math.min(total, Math.floor(this.spreadEl.scrollTop / viewport) + 1));
+		return { page, total };
+	}
+
 	private rebuildOffsets(): void {
 		let unitAcc = 0;
 		this.unitStartSpreads = this.units.map((u) => {
@@ -4907,6 +4919,29 @@ export class ReaderView extends ItemView {
 		const globalSpread = this.getGlobalSpread();
 		const currentSectionIdx = this.getCurrentSectionIndex();
 		if (this.isContinuousFlow()) {
+			if (this.currentFile?.path.toLowerCase().includes("/youtube/")) {
+				const { page, total } = this.getContinuousPageInfo();
+				this.globalPageEl?.setText(`Sayfa ${page} / ${total}`);
+				this.localPageEl?.setText(`Sürekli okuma · ${page} / ${total}`);
+				this.localPageEl?.toggleClass("clp-page-info-max", page === total);
+				this.mobileLocalPage = page;
+				this.mobilePagesLeft = Math.max(0, total - page);
+				if (this.mobileFillEl) {
+					this.mobileFillEl.style.width = `${(page / total) * 100}%`;
+					this.mobileFillEl.toggleClass("clp-mobile-progress-full", page === total);
+				}
+				this.contentEl.querySelectorAll(".clp-progress-segment").forEach((seg) => {
+					const fill = seg.querySelector<HTMLElement>(".clp-progress-segment-fill");
+					if (fill) fill.setCssProps({ width: `${(page / total) * 100}%` });
+					seg.toggleClass("clp-progress-current", page < total);
+					seg.toggleClass("clp-progress-complete", page === total);
+				});
+				this.toolbarChapterEl?.setText(this.sections[currentSectionIdx]?.label ?? "");
+				this.renderMobilePages();
+				this.layoutMobileProgress();
+				this.updateBackMarker();
+				return;
+			}
 			const sectionNumber = Math.max(1, currentSectionIdx + 1);
 			const sectionTotal = Math.max(1, this.sections.length);
 			this.globalPageEl?.setText(`Bölüm ${sectionNumber} / ${sectionTotal}`);
